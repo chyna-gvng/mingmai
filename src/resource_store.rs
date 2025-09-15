@@ -16,7 +16,7 @@ pub struct ResourceStore {
     events: tokio::sync::broadcast::Sender<ResourceEvent>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ResourceInfo {
     pub path: String,
     pub is_dir: bool,
@@ -27,7 +27,7 @@ pub struct RopeFile {
     pub(crate) path: PathBuf,
     pub(crate) rope: Rope,
     dirty: AtomicBool,
-    persist_lock: Mutex<()>,
+    _persist_lock: Mutex<()>,
 }
 
 impl ResourceStore {
@@ -159,7 +159,7 @@ impl ResourceStore {
                 Ok(Rope::new())
             }
         }).await??;
-        let rf = Arc::new(RwLock::new(RopeFile { path: abs.clone(), rope, dirty: AtomicBool::new(false), persist_lock: Mutex::new(()) }));
+        let rf = Arc::new(RwLock::new(RopeFile { path: abs.clone(), rope, dirty: AtomicBool::new(false), _persist_lock: Mutex::new(()) }));
         self.files.insert(abs.clone(), rf.clone());
         Ok(rf)
     }
