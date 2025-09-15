@@ -1,12 +1,15 @@
 use std::{path::Path, sync::Arc};
 
 use rmcp::{
-    model::{CallToolResult, Content, ErrorData, ServerInfo},
+    model::{ErrorData, ServerInfo},
     tool_router,
     handler::server::{ServerHandler, tool::ToolRouter, wrapper::Parameters},
+    Json,
 };
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 
-use crate::{resource_store::ResourceStore, edit::FileEditReq};
+use crate::{resource_store::{ResourceStore, ResourceInfo}, edit::FileEditReq};
 
 #[derive(Clone)]
 pub struct MingmaiServer {
@@ -26,66 +29,105 @@ pub struct CreateFileReq { pub path: String, #[serde(default)] pub content: Stri
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct ListReq { #[serde(default)] pub path: String, #[serde(default)] pub recursive: bool }
 
+// Structured outputs for all tools
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct OkResponse { pub ok: bool }
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct PingResult { pub message: String }
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct CreateFileResult { pub ok: bool, pub path: String }
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct FileViewResult { pub path: String, pub content: String }
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ListResourcesResult { pub items: Vec<ResourceInfo> }
+
 #[tool_router]
 impl MingmaiServer {
     pub fn new(store: Arc<ResourceStore>) -> Self {
         Self { store, tool_router: Self::tool_router() }
     }
 
-    #[rmcp::tool(description = "Ping")] 
-    pub async fn ping(&self, _params: Parameters<PingReq>) -> Result<CallToolResult, ErrorData> {
-        Ok(CallToolResult::success(vec![Content::text("pong")]))
+    #[rmcp::tool(description = "Ping")]
+    pub async fn ping(&self, _params: Parameters<PingReq>) -> Result<Json<PingResult>, ErrorData> {
+        Ok(Json(PingResult { message: "pong".into() }))
     }
 
     // Workspace tools
-    #[rmcp::tool(description = "Create a directory under the workspace root")] 
-    pub async fn workspace_create(&self, params: Parameters<PathOnly>) -> Result<CallToolResult, ErrorData> {
+    #[rmcp::tool(description = "Create a directory under the workspace root")]
+    pub async fn workspace_create(&self, params: Parameters<PathOnly>) -> Result<Json<OkResponse>, ErrorData> {
         let path = params.0.path;
-        self.store.create_dir(Path::new(&path)).await.map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-        Ok(CallToolResult::success(vec![Content::text("ok".to_string())]))
+        self.store
+            .create_dir(Path::new(&path))
+            .await
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        Ok(Json(OkResponse { ok: true }))
     }
 
     #[rmcp::tool(description = "Delete a directory under the workspace root")]
-    pub async fn workspace_delete(&self, params: Parameters<PathOnly>) -> Result<CallToolResult, ErrorData> {
+    pub async fn workspace_delete(&self, params: Parameters<PathOnly>) -> Result<Json<OkResponse>, ErrorData> {
         let path = params.0.path;
-        self.store.delete_dir(Path::new(&path)).await.map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-        Ok(CallToolResult::success(vec![Content::text("ok".to_string())]))
+        self.store
+            .delete_dir(Path::new(&path))
+            .await
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        Ok(Json(OkResponse { ok: true }))
     }
 
     // File tools
     #[rmcp::tool(description = "Create a file with optional content")]
-    pub async fn file_create(&self, params: Parameters<CreateFileReq>) -> Result<CallToolResult, ErrorData> {
+    pub async fn file_create(&self, params: Parameters<CreateFileReq>) -> Result<Json<CreateFileResult>, ErrorData> {
         let req = params.0;
-        self.store.create_file(Path::new(&req.path), req.content).await.map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-        Ok(CallToolResult::success(vec![Content::text("ok".to_string())]))
+        self.store
+            .create_file(Path::new(&req.path), req.content)
+            .await
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        Ok(Json(CreateFileResult { ok: true, path: req.path }))
     }
 
     #[rmcp::tool(description = "Delete a file")]
-    pub async fn file_delete(&self, params: Parameters<PathOnly>) -> Result<CallToolResult, ErrorData> {
+    pub async fn file_delete(&self, params: Parameters<PathOnly>) -> Result<Json<OkResponse>, ErrorData> {
         let path = params.0.path;
-        self.store.delete_file(Path::new(&path)).await.map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-        Ok(CallToolResult::success(vec![Content::text("ok".to_string())]))
+        self.store
+            .delete_file(Path::new(&path))
+            .await
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        Ok(Json(OkResponse { ok: true }))
     }
 
     #[rmcp::tool(description = "Read and return the full file content")]
-    pub async fn file_view(&self, params: Parameters<PathOnly>) -> Result<CallToolResult, ErrorData> {
+    pub async fn file_view(&self, params: Parameters<PathOnly>) -> Result<Json<FileViewResult>, ErrorData> {
         let path = params.0.path;
-        let text = self.store.read_file(Path::new(&path)).await.map_err(|e| ErrorData::resource_not_found(e.to_string(), None))?;
-        Ok(CallToolResult::success(vec![Content::text(text)]))
+        let text = self
+            .store
+            .read_file(Path::new(&path))
+            .await
+            .map_err(|e| ErrorData::resource_not_found(e.to_string(), None))?;
+        Ok(Json(FileViewResult { path, content: text }))
     }
 
     #[rmcp::tool(description = "Apply edits to a file (line/column based)")]
-    pub async fn file_edit(&self, params: Parameters<FileEditReq>) -> Result<CallToolResult, ErrorData> {
+    pub async fn file_edit(&self, params: Parameters<FileEditReq>) -> Result<Json<OkResponse>, ErrorData> {
         let req = params.0;
-        self.store.apply_edits(Path::new(&req.path), req.edits).await.map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
-        Ok(CallToolResult::success(vec![Content::text("ok".to_string())]))
+        self.store
+            .apply_edits(Path::new(&req.path), req.edits)
+            .await
+            .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+        Ok(Json(OkResponse { ok: true }))
     }
 
     #[rmcp::tool(description = "List resources under a path (relative to workspace root)")]
-    pub async fn list_resources(&self, params: Parameters<ListReq>) -> Result<CallToolResult, ErrorData> {
+    pub async fn list_resources(&self, params: Parameters<ListReq>) -> Result<Json<ListResourcesResult>, ErrorData> {
         let req = params.0;
-        let entries = self.store.list_resources(Path::new(&req.path), if req.recursive { true } else { false }).await.map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-        Ok(CallToolResult::structured(serde_json::to_value(&entries).map_err(|e| ErrorData::internal_error(e.to_string(), None))?))
+        let entries = self
+            .store
+            .list_resources(Path::new(&req.path), req.recursive)
+            .await
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        Ok(Json(ListResourcesResult { items: entries }))
     }
 }
 
