@@ -23,10 +23,18 @@ use tracing::{error, info};
 use tree_sitter::{InputEdit, Parser, Point, Tree};
 
 use crate::{
-    edit::{Anchor, ByteEdit, Change, Position, TextEdit},
+    edit::{Anchor, Change},
     events::ResourceEvent,
     parse_manager::LanguageManager,
 };
+
+// Internal-only byte edit representation for normalization pipeline
+#[derive(Debug, Clone)]
+struct ByteEdit {
+    start_byte: usize,
+    old_end_byte: usize,
+    new_text: String,
+}
 
 #[derive(Clone)]
 pub struct ResourceStore {
@@ -185,229 +193,7 @@ impl ResourceStore {
         Ok(guard.rope.to_string())
     }
 
-    // Apply edits and compute corresponding tree-sitter InputEdits in descending order.
-    // Legacy line/column edit path; kept for compatibility with older clients
-    pub async fn apply_edits(&self, path: &Path, mut edits: Vec<TextEdit>) -> Result<()> {
-        let rf = self.open_or_load(path).await?;
-        let input_edits = {
-            let mut file = rf.write().await;
-            // Collect enriched edits with char indices and computed InputEdit using current (pre-edit) rope contents.
-            let mut enriched: Vec<(usize, usize, String, InputEdit)> =
-                Vec::with_capacity(edits.len());
-            for e in edits.drain(..) {
-                let (start_char, end_char) = positions_to_char_range(&file.rope, e.start, e.end)?;
-                let start_byte = file.rope.char_to_byte(start_char);
-                let old_end_byte = file.rope.char_to_byte(end_char);
-                // Convert Positions to Points with byte-based columns
-                let start_point = point_for_position_bytes(&file.rope, e.start);
-                let old_end_point = point_for_position_bytes(&file.rope, e.end);
-                let new_bytes = e.new_text.as_bytes();
-                let new_end_byte = start_byte + new_bytes.len();
-                let new_end_point = add_text_to_point(start_point, new_bytes);
-                let ie = InputEdit {
-                    start_byte,
-                    old_end_byte,
-                    new_end_byte,
-                    start_position: start_point,
-                    old_end_position: old_end_point,
-                    new_end_position: new_end_point,
-                };
-                enriched.push((start_char, end_char, e.new_text, ie));
-            }
-            // Sort descending by start position to apply safely
-            enriched.sort_by(|a, b| b.0.cmp(&a.0));
-
-            // Apply to tree first (so it reflects old coordinates), then mutate rope
-            if let Some(tree) = &mut file.tree {
-                for (_sc, _ec, _txt, ie) in enriched.iter() {
-                    tree.edit(ie);
-                }
-            }
-
-            for (start, end, _new_text, _ie) in enriched.iter() {
-                if *start > *end || *end > file.rope.len_chars() {
-                    return Err(anyhow!("invalid edit range: {}..{}", start, end));
-                }
-            }
-            // collect input edits before consuming enriched
-            let ies: Vec<InputEdit> = enriched.iter().map(|(_, _, _, ie)| *ie).collect();
-            for (start, end, new_text, _ie) in enriched.into_iter() {
-                file.rope.remove(start..end);
-                file.rope.insert(start, &new_text);
-            }
-
-            file.version = file.version.saturating_add(1);
-            file.dirty.store(true, Ordering::SeqCst);
-            self.schedule_persist_unlocked(&rf);
-            ies
-        };
-        // Prefer Edited event; fall back to Modified if empty
-        let abs = self.ensure_within_root(path)?;
-        if input_edits.is_empty() {
-            let _ = self.events.send(ResourceEvent::Modified(abs));
-        } else {
-            let _ = self.events.send(ResourceEvent::Edited(abs, input_edits));
-        }
-        Ok(())
-    }
-
-    pub async fn apply_byte_edits(&self, path: &Path, edits: Vec<ByteEdit>) -> Result<()> {
-        // Back-compat path: delegate to opts with safe defaults
-        self.apply_byte_edits_with_opts(path, edits, false, true)
-            .await
-    }
-
-    pub async fn apply_byte_edits_with_opts(
-        &self,
-        path: &Path,
-        edits: Vec<ByteEdit>,
-        truncate_tail: bool,
-        validate_utf8: bool,
-    ) -> Result<()> {
-        // Validate path and require file existence for editing
-        let abs = self.ensure_within_root(path)?;
-        if !abs.exists() {
-            return Err(anyhow!("file not found: {}", abs.display()));
-        }
-        let rf = self.open_or_load(path).await?;
-        let input_edits = {
-            let mut file = rf.write().await;
-            let file_len = file.rope.len_bytes();
-            // Strict bounds validation and ordering
-            let mut norm: Vec<ByteEdit> = Vec::with_capacity(edits.len());
-            for e in edits.into_iter() {
-                let s = e.start_byte;
-                let o = e.old_end_byte;
-                if s > o {
-                    return Err(anyhow!("start_byte {} must be <= old_end_byte {}", s, o));
-                }
-                if o > file_len || s > file_len {
-                    return Err(anyhow!(
-                        "byte range {}..{} exceeds file size {}",
-                        s,
-                        o,
-                        file_len
-                    ));
-                }
-                if validate_utf8
-                    && (!is_valid_byte_boundary(&file.rope, s)
-                        || !is_valid_byte_boundary(&file.rope, o))
-                {
-                    return Err(anyhow!("byte offsets are not valid UTF-8 boundaries"));
-                }
-                norm.push(ByteEdit {
-                    start_byte: s,
-                    old_end_byte: o,
-                    new_text: e.new_text,
-                });
-            }
-            if truncate_tail {
-                let max_old = norm.iter().map(|e| e.old_end_byte).max().unwrap_or(0);
-                if max_old < file_len {
-                    norm.push(ByteEdit {
-                        start_byte: max_old,
-                        old_end_byte: file_len,
-                        new_text: String::new(),
-                    });
-                }
-            }
-            // Normalize to descending by start_byte
-            norm.sort_by(|a, b| b.start_byte.cmp(&a.start_byte));
-            let mut ies: Vec<InputEdit> = Vec::with_capacity(norm.len());
-            for e in norm.iter() {
-                let start_point = point_for_byte(&file.rope, e.start_byte);
-                let old_end_point = point_for_byte(&file.rope, e.old_end_byte);
-                let new_end_byte = e.start_byte + e.new_text.len();
-                let new_end_point = add_text_to_point(start_point, e.new_text.as_bytes());
-                ies.push(InputEdit {
-                    start_byte: e.start_byte,
-                    old_end_byte: e.old_end_byte,
-                    new_end_byte,
-                    start_position: start_point,
-                    old_end_position: old_end_point,
-                    new_end_position: new_end_point,
-                });
-            }
-            if let Some(tree) = &mut file.tree {
-                for ie in ies.iter() {
-                    tree.edit(ie);
-                }
-            }
-            for e in norm.into_iter() {
-                let start_char = file.rope.byte_to_char(e.start_byte);
-                let old_end_char = file.rope.byte_to_char(e.old_end_byte);
-                file.rope.remove(start_char..old_end_char);
-                file.rope.insert(start_char, &e.new_text);
-            }
-            file.version = file.version.saturating_add(1);
-            file.dirty.store(true, Ordering::SeqCst);
-            self.schedule_persist_unlocked(&rf);
-            ies
-        };
-        let _ = self.events.send(ResourceEvent::Edited(abs, input_edits));
-        Ok(())
-    }
-
-    pub async fn apply_byte_edits_preview(
-        &self,
-        path: &Path,
-        mut edits: Vec<ByteEdit>,
-        truncate_tail: bool,
-        validate_utf8: bool,
-    ) -> Result<usize> {
-        let abs = self.ensure_within_root(path)?;
-        if !abs.exists() {
-            return Err(anyhow!("file not found: {}", abs.display()));
-        }
-        let rf = self.open_or_load(path).await?;
-        let final_len = {
-            let file = rf.read().await;
-            let mut rope = file.rope.clone();
-            for e in &edits {
-                if e.start_byte > e.old_end_byte {
-                    return Err(anyhow!(
-                        "start_byte {} must be <= old_end_byte {}",
-                        e.start_byte,
-                        e.old_end_byte
-                    ));
-                }
-                if e.old_end_byte > rope.len_bytes() || e.start_byte > rope.len_bytes() {
-                    return Err(anyhow!(
-                        "byte range {}..{} exceeds file size {}",
-                        e.start_byte,
-                        e.old_end_byte,
-                        rope.len_bytes()
-                    ));
-                }
-                if validate_utf8
-                    && (!is_valid_byte_boundary(&rope, e.start_byte)
-                        || !is_valid_byte_boundary(&rope, e.old_end_byte))
-                {
-                    return Err(anyhow!("byte offsets are not valid UTF-8 boundaries"));
-                }
-            }
-            if truncate_tail {
-                let max_old = edits.iter().map(|e| e.old_end_byte).max().unwrap_or(0);
-                let file_len = rope.len_bytes();
-                if max_old < file_len {
-                    edits.push(ByteEdit {
-                        start_byte: max_old,
-                        old_end_byte: file_len,
-                        new_text: String::new(),
-                    });
-                }
-            }
-            edits.sort_by(|a, b| b.start_byte.cmp(&a.start_byte));
-            for e in edits.into_iter() {
-                let start_char = rope.byte_to_char(e.start_byte);
-                let old_end_char = rope.byte_to_char(e.old_end_byte);
-                rope.remove(start_char..old_end_char);
-                rope.insert(start_char, &e.new_text);
-            }
-            rope.len_bytes()
-        };
-        Ok(final_len)
-    }
+    // Legacy byte/position editing removed. Use high-level apply_changes.
 
     pub async fn list_resources(&self, path: &Path, recursive: bool) -> Result<Vec<ResourceInfo>> {
         let abs = self.ensure_within_root(path)?;
@@ -705,7 +491,8 @@ impl ResourceStore {
         })
     }
 
-    pub async fn apply_byte_edits_with_validation(
+    #[allow(private_interfaces)]
+    pub(crate) async fn apply_byte_edits_with_validation(
         &self,
         path: &Path,
         edits: Vec<ByteEdit>,
@@ -1010,21 +797,6 @@ fn canonicalize(p: &Path) -> Result<PathBuf> {
     }
 }
 
-#[allow(dead_code)]
-fn positions_to_char_range(rope: &Rope, start: Position, end: Position) -> Result<(usize, usize)> {
-    let start_char = rope.line_to_char(start.line).saturating_add(start.column);
-    let end_char = rope.line_to_char(end.line).saturating_add(end.column);
-    Ok((start_char, end_char))
-}
-
-#[allow(dead_code)]
-fn point_for_position_bytes(rope: &Rope, pos: Position) -> Point {
-    let line_start_char = rope.line_to_char(pos.line);
-    let abs_char = line_start_char.saturating_add(pos.column);
-    let abs_byte = rope.char_to_byte(abs_char);
-    let line_start_byte = rope.char_to_byte(line_start_char);
-    Point::new(pos.line, abs_byte - line_start_byte)
-}
 
 fn point_for_byte(rope: &Rope, byte: usize) -> Point {
     let char_idx = rope.byte_to_char(byte);
