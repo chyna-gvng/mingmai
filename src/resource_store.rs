@@ -1,14 +1,31 @@
-use std::{collections::VecDeque, fs, io::{BufReader, BufWriter}, path::{Path, PathBuf}, sync::{Arc, atomic::{AtomicBool, Ordering}}};
+use std::{
+    collections::VecDeque,
+    fs,
+    io::{BufReader, BufWriter},
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use dashmap::DashMap;
 use ropey::Rope;
 use serde::{Deserialize, Serialize};
-use tokio::{fs as tokio_fs, sync::{RwLock, Mutex}, task, time::{sleep, Duration}};
-use tracing::{info, error};
+use tokio::{
+    fs as tokio_fs,
+    sync::{Mutex, RwLock},
+    task,
+    time::{Duration, sleep},
+};
+use tracing::{error, info};
 use tree_sitter::{InputEdit, Point, Tree};
 
-use crate::{edit::{TextEdit, Position, ByteEdit}, events::ResourceEvent};
+use crate::{
+    edit::{ByteEdit, Position, TextEdit},
+    events::ResourceEvent,
+};
 
 #[derive(Clone)]
 pub struct ResourceStore {
@@ -17,7 +34,7 @@ pub struct ResourceStore {
     events: tokio::sync::broadcast::Sender<ResourceEvent>,
 }
 
-#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ResourceInfo {
     pub path: String,
     pub is_dir: bool,
@@ -42,7 +59,11 @@ impl ResourceStore {
             tokio_fs::create_dir_all(&root).await?;
         }
         let (tx, _rx) = tokio::sync::broadcast::channel(1024);
-        Ok(Self { root, files: Arc::new(DashMap::new()), events: tx })
+        Ok(Self {
+            root,
+            files: Arc::new(DashMap::new()),
+            events: tx,
+        })
     }
 
     pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<ResourceEvent> {
@@ -53,21 +74,59 @@ impl ResourceStore {
         &self.root
     }
 
-    fn ensure_within_root(&self, path: &Path) -> Result<PathBuf> {
-        let joined = self.root.join(path);
-        // Normalize without requiring existence.
-        let abs = joined;
-        let canon_root = std::fs::canonicalize(&self.root).unwrap_or(self.root.clone());
-        let abs_norm = abs;
-        // Basic traversal prevention: no prefix like ".." at beginning
-        let is_escape = abs_norm.components().any(|c| matches!(c, std::path::Component::Prefix(_)));
-        if is_escape { return Err(anyhow!("invalid path")); }
-        // Final check on string prefix
-        let abs_str = abs_norm.as_path();
-        if !abs_str.starts_with(&canon_root) && abs_str.is_absolute() {
-            return Err(anyhow!("path escapes workspace root: {}", abs_str.display()));
+    pub fn ensure_within_root(&self, path: &Path) -> Result<PathBuf> {
+        // Accept absolute paths if and only if they are within the workspace root
+        if path.is_absolute() {
+            let canon_root = std::fs::canonicalize(&self.root).unwrap_or(self.root.clone());
+            let abs_canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+            if abs_canon.starts_with(&canon_root) {
+                return Ok(abs_canon);
+            }
+            return Err(anyhow!(
+                "absolute path outside workspace root: given={}, root={}",
+                abs_canon.display(),
+                canon_root.display()
+            ));
         }
-        Ok(abs_str.to_path_buf())
+        // Reject NUL bytes (invalid for OS operations)
+        if path.as_os_str().to_string_lossy().contains('\u{0000}') {
+            return Err(anyhow!(
+                "invalid path: contains NUL byte (path={})",
+                path.display()
+            ));
+        }
+        // Normalize the provided path and prevent traversal outside the workspace root
+        use std::path::Component::*;
+        let mut rel_stack: Vec<std::ffi::OsString> = Vec::new();
+        for comp in path.components() {
+            match comp {
+                CurDir => { /* ignore */ }
+                ParentDir => {
+                    if rel_stack.pop().is_none() {
+                        return Err(anyhow!(
+                            "path escapes workspace root (path={})",
+                            path.display()
+                        ));
+                    }
+                }
+                Normal(c) => {
+                    if !c.is_empty() {
+                        rel_stack.push(c.to_os_string());
+                    }
+                }
+                Prefix(_) | RootDir => {
+                    return Err(anyhow!(
+                        "invalid path: absolute or prefixed component (path={})",
+                        path.display()
+                    ));
+                }
+            }
+        }
+        let mut abs = self.root.clone();
+        for c in rel_stack {
+            abs.push(c);
+        }
+        Ok(abs)
     }
 
     pub async fn create_dir(&self, path: &Path) -> Result<()> {
@@ -86,7 +145,9 @@ impl ResourceStore {
 
     pub async fn create_file(&self, path: &Path, content: String) -> Result<()> {
         let abs = self.ensure_within_root(path)?;
-        if let Some(parent) = abs.parent() { tokio_fs::create_dir_all(parent).await?; }
+        if let Some(parent) = abs.parent() {
+            tokio_fs::create_dir_all(parent).await?;
+        }
         tokio_fs::write(&abs, content.as_bytes()).await?;
         self.files.remove(&abs);
         let _ = self.events.send(ResourceEvent::Created(abs.clone()));
@@ -114,7 +175,8 @@ impl ResourceStore {
         let input_edits = {
             let mut file = rf.write().await;
             // Collect enriched edits with char indices and computed InputEdit using current (pre-edit) rope contents.
-            let mut enriched: Vec<(usize, usize, String, InputEdit)> = Vec::with_capacity(edits.len());
+            let mut enriched: Vec<(usize, usize, String, InputEdit)> =
+                Vec::with_capacity(edits.len());
             for e in edits.drain(..) {
                 let (start_char, end_char) = positions_to_char_range(&file.rope, e.start, e.end)?;
                 let start_byte = file.rope.char_to_byte(start_char);
@@ -174,31 +236,62 @@ impl ResourceStore {
 
     pub async fn apply_byte_edits(&self, path: &Path, edits: Vec<ByteEdit>) -> Result<()> {
         // Back-compat path: delegate to opts with safe defaults
-        self.apply_byte_edits_with_opts(path, edits, false, true).await
+        self.apply_byte_edits_with_opts(path, edits, false, true)
+            .await
     }
 
-    pub async fn apply_byte_edits_with_opts(&self, path: &Path, edits: Vec<ByteEdit>, truncate_tail: bool, validate_utf8: bool) -> Result<()> {
+    pub async fn apply_byte_edits_with_opts(
+        &self,
+        path: &Path,
+        edits: Vec<ByteEdit>,
+        truncate_tail: bool,
+        validate_utf8: bool,
+    ) -> Result<()> {
+        // Validate path and require file existence for editing
+        let abs = self.ensure_within_root(path)?;
+        if !abs.exists() {
+            return Err(anyhow!("file not found: {}", abs.display()));
+        }
         let rf = self.open_or_load(path).await?;
         let input_edits = {
             let mut file = rf.write().await;
             let file_len = file.rope.len_bytes();
-            // Clamp to file bounds and fix ordering
+            // Strict bounds validation and ordering
             let mut norm: Vec<ByteEdit> = Vec::with_capacity(edits.len());
             for e in edits.into_iter() {
-                let mut s = e.start_byte.min(file_len);
-                let mut o = e.old_end_byte.min(file_len);
-                if s > o { std::mem::swap(&mut s, &mut o); }
-                if validate_utf8 {
-                    if !is_valid_byte_boundary(&file.rope, s) || !is_valid_byte_boundary(&file.rope, o) {
-                        return Err(anyhow!("byte offsets are not valid UTF-8 boundaries"));
-                    }
+                let s = e.start_byte;
+                let o = e.old_end_byte;
+                if s > o {
+                    return Err(anyhow!("start_byte {} must be <= old_end_byte {}", s, o));
                 }
-                norm.push(ByteEdit { start_byte: s, old_end_byte: o, new_text: e.new_text });
+                if o > file_len || s > file_len {
+                    return Err(anyhow!(
+                        "byte range {}..{} exceeds file size {}",
+                        s,
+                        o,
+                        file_len
+                    ));
+                }
+                if validate_utf8
+                    && (!is_valid_byte_boundary(&file.rope, s)
+                        || !is_valid_byte_boundary(&file.rope, o))
+                {
+                    return Err(anyhow!("byte offsets are not valid UTF-8 boundaries"));
+                }
+                norm.push(ByteEdit {
+                    start_byte: s,
+                    old_end_byte: o,
+                    new_text: e.new_text,
+                });
             }
             if truncate_tail {
                 let max_old = norm.iter().map(|e| e.old_end_byte).max().unwrap_or(0);
                 if max_old < file_len {
-                    norm.push(ByteEdit { start_byte: max_old, old_end_byte: file_len, new_text: String::new() });
+                    norm.push(ByteEdit {
+                        start_byte: max_old,
+                        old_end_byte: file_len,
+                        new_text: String::new(),
+                    });
                 }
             }
             // Normalize to descending by start_byte
@@ -219,7 +312,9 @@ impl ResourceStore {
                 });
             }
             if let Some(tree) = &mut file.tree {
-                for ie in ies.iter() { tree.edit(ie); }
+                for ie in ies.iter() {
+                    tree.edit(ie);
+                }
             }
             for e in norm.into_iter() {
                 let start_char = file.rope.byte_to_char(e.start_byte);
@@ -232,28 +327,57 @@ impl ResourceStore {
             self.schedule_persist_unlocked(&rf);
             ies
         };
-        let abs = self.ensure_within_root(path)?;
         let _ = self.events.send(ResourceEvent::Edited(abs, input_edits));
         Ok(())
     }
 
-    pub async fn apply_byte_edits_preview(&self, path: &Path, mut edits: Vec<ByteEdit>, truncate_tail: bool, validate_utf8: bool) -> Result<usize> {
+    pub async fn apply_byte_edits_preview(
+        &self,
+        path: &Path,
+        mut edits: Vec<ByteEdit>,
+        truncate_tail: bool,
+        validate_utf8: bool,
+    ) -> Result<usize> {
+        let abs = self.ensure_within_root(path)?;
+        if !abs.exists() {
+            return Err(anyhow!("file not found: {}", abs.display()));
+        }
         let rf = self.open_or_load(path).await?;
         let final_len = {
             let file = rf.read().await;
             let mut rope = file.rope.clone();
-            if validate_utf8 {
-                for e in &edits {
-                    if !is_valid_byte_boundary(&rope, e.start_byte) || !is_valid_byte_boundary(&rope, e.old_end_byte) {
-                        return Err(anyhow!("byte offsets are not valid UTF-8 boundaries"));
-                    }
+            for e in &edits {
+                if e.start_byte > e.old_end_byte {
+                    return Err(anyhow!(
+                        "start_byte {} must be <= old_end_byte {}",
+                        e.start_byte,
+                        e.old_end_byte
+                    ));
+                }
+                if e.old_end_byte > rope.len_bytes() || e.start_byte > rope.len_bytes() {
+                    return Err(anyhow!(
+                        "byte range {}..{} exceeds file size {}",
+                        e.start_byte,
+                        e.old_end_byte,
+                        rope.len_bytes()
+                    ));
+                }
+                if validate_utf8
+                    && (!is_valid_byte_boundary(&rope, e.start_byte)
+                        || !is_valid_byte_boundary(&rope, e.old_end_byte))
+                {
+                    return Err(anyhow!("byte offsets are not valid UTF-8 boundaries"));
                 }
             }
             if truncate_tail {
                 let max_old = edits.iter().map(|e| e.old_end_byte).max().unwrap_or(0);
                 let file_len = rope.len_bytes();
                 if max_old < file_len {
-                    edits.push(ByteEdit { start_byte: max_old, old_end_byte: file_len, new_text: String::new() });
+                    edits.push(ByteEdit {
+                        start_byte: max_old,
+                        old_end_byte: file_len,
+                        new_text: String::new(),
+                    });
                 }
             }
             edits.sort_by(|a, b| b.start_byte.cmp(&a.start_byte));
@@ -271,7 +395,9 @@ impl ResourceStore {
     pub async fn list_resources(&self, path: &Path, recursive: bool) -> Result<Vec<ResourceInfo>> {
         let abs = self.ensure_within_root(path)?;
         let mut out = Vec::new();
-        if !abs.exists() { return Ok(out); }
+        if !abs.exists() {
+            return Ok(out);
+        }
         if recursive {
             let mut q = VecDeque::from([abs]);
             while let Some(dir) = q.pop_front() {
@@ -279,9 +405,19 @@ impl ResourceStore {
                 while let Some(entry) = rd.next_entry().await? {
                     let meta = entry.metadata().await?;
                     let is_dir = meta.is_dir();
-                    let rel = entry.path().strip_prefix(&self.root).unwrap_or(entry.path().as_path()).to_path_buf();
-                    out.push(ResourceInfo { path: rel.to_string_lossy().into_owned(), is_dir, size: (!is_dir).then_some(meta.len()) });
-                    if is_dir { q.push_back(entry.path()); }
+                    let rel = entry
+                        .path()
+                        .strip_prefix(&self.root)
+                        .unwrap_or(entry.path().as_path())
+                        .to_path_buf();
+                    out.push(ResourceInfo {
+                        path: rel.to_string_lossy().into_owned(),
+                        is_dir,
+                        size: (!is_dir).then_some(meta.len()),
+                    });
+                    if is_dir {
+                        q.push_back(entry.path());
+                    }
                 }
             }
         } else {
@@ -289,8 +425,16 @@ impl ResourceStore {
             while let Some(entry) = rd.next_entry().await? {
                 let meta = entry.metadata().await?;
                 let is_dir = meta.is_dir();
-                let rel = entry.path().strip_prefix(&self.root).unwrap_or(entry.path().as_path()).to_path_buf();
-                out.push(ResourceInfo { path: rel.to_string_lossy().into_owned(), is_dir, size: (!is_dir).then_some(meta.len()) });
+                let rel = entry
+                    .path()
+                    .strip_prefix(&self.root)
+                    .unwrap_or(entry.path().as_path())
+                    .to_path_buf();
+                out.push(ResourceInfo {
+                    path: rel.to_string_lossy().into_owned(),
+                    is_dir,
+                    size: (!is_dir).then_some(meta.len()),
+                });
             }
         }
         Ok(out)
@@ -299,7 +443,12 @@ impl ResourceStore {
     pub async fn snapshot(&self, path: &Path) -> Result<(PathBuf, Rope, Option<Tree>, u64)> {
         let rf = self.open_or_load(path).await?;
         let guard = rf.read().await;
-        Ok((guard.path.clone(), guard.rope.clone(), guard.tree.clone(), guard.version))
+        Ok((
+            guard.path.clone(),
+            guard.rope.clone(),
+            guard.tree.clone(),
+            guard.version,
+        ))
     }
 
     pub async fn update_tree(&self, path: &Path, new_tree: Tree, version: u64) -> Result<()> {
@@ -315,18 +464,30 @@ impl ResourceStore {
 
     async fn open_or_load(&self, path: &Path) -> Result<Arc<RwLock<RopeFile>>> {
         let abs = self.ensure_within_root(path)?;
-        if let Some(r) = self.files.get(&abs) { return Ok(r.value().clone()); }
+        if let Some(r) = self.files.get(&abs) {
+            return Ok(r.value().clone());
+        }
         let abs_clone = abs.clone();
         let rope = task::spawn_blocking(move || -> Result<Rope> {
             if abs_clone.exists() {
-                let f = fs::File::open(&abs_clone).with_context(|| format!("open {}", abs_clone.display()))?;
+                let f = fs::File::open(&abs_clone)
+                    .with_context(|| format!("open {}", abs_clone.display()))?;
                 let mut reader = BufReader::new(f);
                 Rope::from_reader(&mut reader).context("rope load")
             } else {
                 Ok(Rope::new())
             }
-        }).await??;
-        let rf = Arc::new(RwLock::new(RopeFile { path: abs.clone(), rope, tree: None, version: 0, parsed_version: 0, dirty: AtomicBool::new(false), _persist_lock: Mutex::new(()) }));
+        })
+        .await??;
+        let rf = Arc::new(RwLock::new(RopeFile {
+            path: abs.clone(),
+            rope,
+            tree: None,
+            version: 0,
+            parsed_version: 0,
+            dirty: AtomicBool::new(false),
+            _persist_lock: Mutex::new(()),
+        }));
         self.files.insert(abs.clone(), rf.clone());
         Ok(rf)
     }
@@ -359,7 +520,9 @@ impl ResourceStore {
 }
 
 async fn persist_rope(path: &Path, rope: &Rope) -> Result<()> {
-    if let Some(parent) = path.parent() { tokio_fs::create_dir_all(parent).await?; }
+    if let Some(parent) = path.parent() {
+        tokio_fs::create_dir_all(parent).await?;
+    }
     let rope = rope.clone();
     let path = path.to_path_buf();
     task::spawn_blocking(move || -> Result<()> {
@@ -367,12 +530,17 @@ async fn persist_rope(path: &Path, rope: &Rope) -> Result<()> {
         let mut writer = BufWriter::new(f);
         rope.write_to(&mut writer).context("rope write")?;
         Ok(())
-    }).await??;
+    })
+    .await??;
     Ok(())
 }
 
 fn canonicalize(p: &Path) -> Result<PathBuf> {
-    if p.exists() { std::fs::canonicalize(p).map_err(Into::into) } else { Ok(p.to_path_buf()) }
+    if p.exists() {
+        std::fs::canonicalize(p).map_err(Into::into)
+    } else {
+        Ok(p.to_path_buf())
+    }
 }
 
 #[allow(dead_code)]
@@ -404,7 +572,12 @@ fn add_text_to_point(start: Point, new_bytes: &[u8]) -> Point {
     let mut rows = 0usize;
     let mut col = start.column;
     for &b in new_bytes {
-        if b == b'\n' { rows += 1; col = 0; } else { col += 1; }
+        if b == b'\n' {
+            rows += 1;
+            col = 0;
+        } else {
+            col += 1;
+        }
     }
     Point::new(start.row + rows, col)
 }
