@@ -177,28 +177,34 @@ impl ResourceStore {
         self.apply_byte_edits_with_opts(path, edits, false, true).await
     }
 
-    pub async fn apply_byte_edits_with_opts(&self, path: &Path, mut edits: Vec<ByteEdit>, truncate_tail: bool, validate_utf8: bool) -> Result<()> {
+    pub async fn apply_byte_edits_with_opts(&self, path: &Path, edits: Vec<ByteEdit>, truncate_tail: bool, validate_utf8: bool) -> Result<()> {
         let rf = self.open_or_load(path).await?;
         let input_edits = {
             let mut file = rf.write().await;
-            if validate_utf8 {
-                for e in &edits {
-                    if !is_valid_byte_boundary(&file.rope, e.start_byte) || !is_valid_byte_boundary(&file.rope, e.old_end_byte) {
+            let file_len = file.rope.len_bytes();
+            // Clamp to file bounds and fix ordering
+            let mut norm: Vec<ByteEdit> = Vec::with_capacity(edits.len());
+            for e in edits.into_iter() {
+                let mut s = e.start_byte.min(file_len);
+                let mut o = e.old_end_byte.min(file_len);
+                if s > o { std::mem::swap(&mut s, &mut o); }
+                if validate_utf8 {
+                    if !is_valid_byte_boundary(&file.rope, s) || !is_valid_byte_boundary(&file.rope, o) {
                         return Err(anyhow!("byte offsets are not valid UTF-8 boundaries"));
                     }
                 }
+                norm.push(ByteEdit { start_byte: s, old_end_byte: o, new_text: e.new_text });
             }
             if truncate_tail {
-                let max_old = edits.iter().map(|e| e.old_end_byte).max().unwrap_or(0);
-                let file_len = file.rope.len_bytes();
+                let max_old = norm.iter().map(|e| e.old_end_byte).max().unwrap_or(0);
                 if max_old < file_len {
-                    edits.push(ByteEdit { start_byte: max_old, old_end_byte: file_len, new_text: String::new() });
+                    norm.push(ByteEdit { start_byte: max_old, old_end_byte: file_len, new_text: String::new() });
                 }
             }
             // Normalize to descending by start_byte
-            edits.sort_by(|a, b| b.start_byte.cmp(&a.start_byte));
-            let mut ies: Vec<InputEdit> = Vec::with_capacity(edits.len());
-            for e in edits.iter() {
+            norm.sort_by(|a, b| b.start_byte.cmp(&a.start_byte));
+            let mut ies: Vec<InputEdit> = Vec::with_capacity(norm.len());
+            for e in norm.iter() {
                 let start_point = point_for_byte(&file.rope, e.start_byte);
                 let old_end_point = point_for_byte(&file.rope, e.old_end_byte);
                 let new_end_byte = e.start_byte + e.new_text.len();
@@ -215,7 +221,7 @@ impl ResourceStore {
             if let Some(tree) = &mut file.tree {
                 for ie in ies.iter() { tree.edit(ie); }
             }
-            for e in edits.into_iter() {
+            for e in norm.into_iter() {
                 let start_char = file.rope.byte_to_char(e.start_byte);
                 let old_end_char = file.rope.byte_to_char(e.old_end_byte);
                 file.rope.remove(start_char..old_end_char);
