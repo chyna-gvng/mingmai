@@ -16,3 +16,15 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 dashmap = "5"
 pathdiff = "0.2"
 schemars = "1"
+# Tree-sitter core and language grammars
+# We pin core to a recent 0.25 release; language crates track compatible versions.
+tree-sitter = "0.25"
+# Pin language crates to compatible recent versions
+# Some grammars publish at 0.23.x; JS/Python at 0.25.x
+# Parser will validate at runtime and error if incompatible.
+tree-sitter-rust = "0.23"
+tree-sitter-javascript = "0.25"
+tree-sitter-typescript = "0.23"
+tree-sitter-python = "0.25"
+tree-sitter-bash = "0.23"
+tree-sitter-html = "0.23"
