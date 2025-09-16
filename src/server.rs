@@ -9,7 +9,7 @@ use rmcp::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::{resource_store::{ResourceStore, ResourceInfo}, edit::FileEditReq};
+use crate::{resource_store::{ResourceStore, ResourceInfo}, edit::FileEditReq, parse_manager::ParseManager};
 
 #[derive(Clone)]
 pub struct MingmaiServer {
@@ -29,6 +29,9 @@ pub struct CreateFileReq { pub path: String, #[serde(default)] pub content: Stri
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct ListReq { #[serde(default)] pub path: String, #[serde(default)] pub recursive: bool }
 
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct ParseReq { pub path: String }
+
 // Structured outputs for all tools
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct OkResponse { pub ok: bool }
@@ -44,6 +47,9 @@ pub struct FileViewResult { pub path: String, pub content: String }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct ListResourcesResult { pub items: Vec<ResourceInfo> }
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ParseResult { pub ok: bool, pub has_tree: bool }
 
 #[tool_router]
 impl MingmaiServer {
@@ -128,6 +134,17 @@ impl MingmaiServer {
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         Ok(Json(ListResourcesResult { items: entries }))
+    }
+
+    // Parsing tools (initial minimal set)
+    #[rmcp::tool(description = "Parse a document now and update internal tree snapshot")]
+    pub async fn parse_document(&self, params: Parameters<ParseReq>) -> Result<Json<ParseResult>, ErrorData> {
+        let req = params.0;
+        let pm = ParseManager::new(self.store.clone());
+        let tree = pm.parse_now(Path::new(&req.path))
+            .await
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        Ok(Json(ParseResult { ok: true, has_tree: tree.is_some() }))
     }
 }
 
