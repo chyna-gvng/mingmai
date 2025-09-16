@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    edit::{ByteEdit, Change},
+    edit::Change,
     parse_manager::{GrammarInfo, LanguageManager, ParseManager},
     resource_store::{ResourceInfo, ResourceStore},
 };
@@ -97,18 +97,7 @@ pub struct ParseReq {
     pub path: String,
 }
 
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-pub struct AstEditReq {
-    pub path: String,
-    pub edits: Vec<ByteEdit>,
-    #[serde(default)]
-    pub truncate_tail: bool,
-    #[serde(default)]
-    pub dry_run: bool,
-    #[serde(default = "default_true")]
-    pub validate_utf8: bool,
-}
-
+// legacy ast_edit removed in favor of ast_apply_changes
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct AstQueryReq {
     pub path: String,
@@ -396,62 +385,7 @@ impl MingmaiServer {
         }
     }
 
-    // AST / Parsing tools (legacy low-level byte edits)
-    #[rmcp::tool(
-        description = "Apply byte-accurate edits; validates bounds and file existence. Use dry_run=true for a preview."
-    )]
-    pub async fn ast_edit(
-        &self,
-        params: Parameters<AstEditReq>,
-    ) -> Result<Json<Envelope<AstEditResult>>, ErrorData> {
-        let req = params.0;
-        if req.dry_run {
-            return match self
-                .store
-                .apply_byte_edits_preview(
-                    Path::new(&req.path),
-                    req.edits.clone(),
-                    req.truncate_tail,
-                    req.validate_utf8,
-                )
-                .await
-            {
-                Ok(final_len) => Ok(Json(ok(AstEditResult {
-                    applied: false,
-                    preview: Some(EditPreview {
-                        final_len_bytes: final_len,
-                    }),
-                }))),
-                Err(e) => Ok(Json(err(
-                    "invalid_params",
-                    format!("{} (path={})", e, req.path),
-                ))),
-            };
-        }
-        match self
-            .store
-            .apply_byte_edits_with_validation(
-                Path::new(&req.path),
-                req.edits,
-                /*enforce_parse=*/ true,
-                /*create_backup=*/ true,
-                /*validate_utf8=*/ req.validate_utf8,
-                /*truncate_tail=*/ req.truncate_tail,
-            )
-            .await
-        {
-            Ok(_) => Ok(Json(ok(AstEditResult {
-                applied: true,
-                preview: None,
-            }))),
-            Err(e) => Ok(Json(err(
-                "invalid_params",
-                format!("{} (path={})", e, req.path),
-            ))),
-        }
-    }
-
-    // New high-level change application API
+    // AST / Parsing tools
     #[rmcp::tool(
         description = "Apply high-level AST changes (anchors/queries/nodes); server computes byte edits and validates parse before commit."
     )]
