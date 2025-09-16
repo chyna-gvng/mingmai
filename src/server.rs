@@ -9,7 +9,7 @@ use rmcp::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::{resource_store::{ResourceStore, ResourceInfo}, edit::FileEditReq, parse_manager::ParseManager};
+use crate::{resource_store::{ResourceStore, ResourceInfo}, edit::ByteEdit, parse_manager::ParseManager};
 
 #[derive(Clone)]
 pub struct MingmaiServer {
@@ -31,6 +31,9 @@ pub struct ListReq { #[serde(default)] pub path: String, #[serde(default)] pub r
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct ParseReq { pub path: String }
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct AstByteEditsReq { pub path: String, pub edits: Vec<ByteEdit> }
 
 // Structured outputs for all tools
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -115,13 +118,18 @@ impl MingmaiServer {
         Ok(Json(FileViewResult { path, content: text }))
     }
 
-    #[rmcp::tool(description = "Apply edits to a file (line/column based)")]
-    pub async fn file_edit(&self, params: Parameters<FileEditReq>) -> Result<Json<OkResponse>, ErrorData> {
+    // NOTE: The legacy line/column `file_edit` tool has been removed in favor of AST-based byte edits.
+
+    #[rmcp::tool(description = "Apply byte-accurate AST edits to a file")]
+    pub async fn ast_apply_byte_edits(&self, params: Parameters<AstByteEditsReq>) -> Result<Json<OkResponse>, ErrorData> {
         let req = params.0;
         self.store
-            .apply_edits(Path::new(&req.path), req.edits)
+            .apply_byte_edits(Path::new(&req.path), req.edits)
             .await
             .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+        // After byte edits, parse to maintain updated tree snapshot
+        let pm = ParseManager::new(self.store.clone());
+        let _ = pm.parse_now(Path::new(&req.path)).await.map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         Ok(Json(OkResponse { ok: true }))
     }
 
