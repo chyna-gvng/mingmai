@@ -34,6 +34,7 @@ pub struct RopeFile {
     _persist_lock: Mutex<()>,
 }
 
+#[allow(dead_code)]
 impl ResourceStore {
     pub async fn new(root: PathBuf) -> Result<Self> {
         let root = canonicalize(&root)?;
@@ -144,11 +145,13 @@ impl ResourceStore {
                 }
             }
 
-            for (start, end, new_text, _ie) in enriched.iter() {
+            for (start, end, _new_text, _ie) in enriched.iter() {
                 if *start > *end || *end > file.rope.len_chars() {
                     return Err(anyhow!("invalid edit range: {}..{}", start, end));
                 }
             }
+            // collect input edits before consuming enriched
+            let ies: Vec<InputEdit> = enriched.iter().map(|(_, _, _, ie)| *ie).collect();
             for (start, end, new_text, _ie) in enriched.into_iter() {
                 file.rope.remove(start..end);
                 file.rope.insert(start, &new_text);
@@ -157,13 +160,7 @@ impl ResourceStore {
             file.version = file.version.saturating_add(1);
             file.dirty.store(true, Ordering::SeqCst);
             self.schedule_persist_unlocked(&rf);
-            // Build vector of InputEdits to emit
-            // NB: InputEdit implements Clone in tree-sitter 0.25
-            let mut ies: Vec<InputEdit> = Vec::new();
-            // cannot use enriched (moved); recompute is costly; to avoid move, we cloned by iter above? We consumed.
-            // We already consumed enriched; so rebuild ies while we had it. Adjust: we created ies before consuming.
-            // But we are after consumption; we'll emit Modified for now to avoid cost and complexity.
-            Vec::<InputEdit>::new()
+            ies
         };
         // Prefer Edited event; fall back to Modified if empty
         let abs = self.ensure_within_root(path)?;
@@ -175,18 +172,36 @@ impl ResourceStore {
         Ok(())
     }
 
-    pub async fn apply_byte_edits(&self, path: &Path, mut edits: Vec<ByteEdit>) -> Result<()> {
+    pub async fn apply_byte_edits(&self, path: &Path, edits: Vec<ByteEdit>) -> Result<()> {
+        // Back-compat path: delegate to opts with safe defaults
+        self.apply_byte_edits_with_opts(path, edits, false, true).await
+    }
+
+    pub async fn apply_byte_edits_with_opts(&self, path: &Path, mut edits: Vec<ByteEdit>, truncate_tail: bool, validate_utf8: bool) -> Result<()> {
         let rf = self.open_or_load(path).await?;
         let input_edits = {
             let mut file = rf.write().await;
+            if validate_utf8 {
+                for e in &edits {
+                    if !is_valid_byte_boundary(&file.rope, e.start_byte) || !is_valid_byte_boundary(&file.rope, e.old_end_byte) {
+                        return Err(anyhow!("byte offsets are not valid UTF-8 boundaries"));
+                    }
+                }
+            }
+            if truncate_tail {
+                let max_old = edits.iter().map(|e| e.old_end_byte).max().unwrap_or(0);
+                let file_len = file.rope.len_bytes();
+                if max_old < file_len {
+                    edits.push(ByteEdit { start_byte: max_old, old_end_byte: file_len, new_text: String::new() });
+                }
+            }
             // Normalize to descending by start_byte
             edits.sort_by(|a, b| b.start_byte.cmp(&a.start_byte));
             let mut ies: Vec<InputEdit> = Vec::with_capacity(edits.len());
             for e in edits.iter() {
-                // Compute Points for old range using current rope
                 let start_point = point_for_byte(&file.rope, e.start_byte);
                 let old_end_point = point_for_byte(&file.rope, e.old_end_byte);
-                let new_end_byte = e.start_byte + e.new_text.as_bytes().len();
+                let new_end_byte = e.start_byte + e.new_text.len();
                 let new_end_point = add_text_to_point(start_point, e.new_text.as_bytes());
                 ies.push(InputEdit {
                     start_byte: e.start_byte,
@@ -197,22 +212,15 @@ impl ResourceStore {
                     new_end_position: new_end_point,
                 });
             }
-
-            // Apply to tree first
             if let Some(tree) = &mut file.tree {
-                for ie in ies.iter() {
-                    tree.edit(ie);
-                }
+                for ie in ies.iter() { tree.edit(ie); }
             }
-            // Then apply to rope
             for e in edits.into_iter() {
-                // Convert byte offsets to char indices for Ropey
                 let start_char = file.rope.byte_to_char(e.start_byte);
                 let old_end_char = file.rope.byte_to_char(e.old_end_byte);
                 file.rope.remove(start_char..old_end_char);
                 file.rope.insert(start_char, &e.new_text);
             }
-
             file.version = file.version.saturating_add(1);
             file.dirty.store(true, Ordering::SeqCst);
             self.schedule_persist_unlocked(&rf);
@@ -221,6 +229,37 @@ impl ResourceStore {
         let abs = self.ensure_within_root(path)?;
         let _ = self.events.send(ResourceEvent::Edited(abs, input_edits));
         Ok(())
+    }
+
+    pub async fn apply_byte_edits_preview(&self, path: &Path, mut edits: Vec<ByteEdit>, truncate_tail: bool, validate_utf8: bool) -> Result<usize> {
+        let rf = self.open_or_load(path).await?;
+        let final_len = {
+            let file = rf.read().await;
+            let mut rope = file.rope.clone();
+            if validate_utf8 {
+                for e in &edits {
+                    if !is_valid_byte_boundary(&rope, e.start_byte) || !is_valid_byte_boundary(&rope, e.old_end_byte) {
+                        return Err(anyhow!("byte offsets are not valid UTF-8 boundaries"));
+                    }
+                }
+            }
+            if truncate_tail {
+                let max_old = edits.iter().map(|e| e.old_end_byte).max().unwrap_or(0);
+                let file_len = rope.len_bytes();
+                if max_old < file_len {
+                    edits.push(ByteEdit { start_byte: max_old, old_end_byte: file_len, new_text: String::new() });
+                }
+            }
+            edits.sort_by(|a, b| b.start_byte.cmp(&a.start_byte));
+            for e in edits.into_iter() {
+                let start_char = rope.byte_to_char(e.start_byte);
+                let old_end_char = rope.byte_to_char(e.old_end_byte);
+                rope.remove(start_char..old_end_char);
+                rope.insert(start_char, &e.new_text);
+            }
+            rope.len_bytes()
+        };
+        Ok(final_len)
     }
 
     pub async fn list_resources(&self, path: &Path, recursive: bool) -> Result<Vec<ResourceInfo>> {
@@ -235,7 +274,7 @@ impl ResourceStore {
                     let meta = entry.metadata().await?;
                     let is_dir = meta.is_dir();
                     let rel = entry.path().strip_prefix(&self.root).unwrap_or(entry.path().as_path()).to_path_buf();
-                    out.push(ResourceInfo { path: rel.to_string_lossy().into_owned(), is_dir, size: meta.len().into() });
+                    out.push(ResourceInfo { path: rel.to_string_lossy().into_owned(), is_dir, size: (!is_dir).then_some(meta.len()) });
                     if is_dir { q.push_back(entry.path()); }
                 }
             }
@@ -245,7 +284,7 @@ impl ResourceStore {
                 let meta = entry.metadata().await?;
                 let is_dir = meta.is_dir();
                 let rel = entry.path().strip_prefix(&self.root).unwrap_or(entry.path().as_path()).to_path_buf();
-                out.push(ResourceInfo { path: rel.to_string_lossy().into_owned(), is_dir, size: meta.len().into() });
+                out.push(ResourceInfo { path: rel.to_string_lossy().into_owned(), is_dir, size: (!is_dir).then_some(meta.len()) });
             }
         }
         Ok(out)
@@ -330,12 +369,14 @@ fn canonicalize(p: &Path) -> Result<PathBuf> {
     if p.exists() { std::fs::canonicalize(p).map_err(Into::into) } else { Ok(p.to_path_buf()) }
 }
 
+#[allow(dead_code)]
 fn positions_to_char_range(rope: &Rope, start: Position, end: Position) -> Result<(usize, usize)> {
     let start_char = rope.line_to_char(start.line).saturating_add(start.column);
     let end_char = rope.line_to_char(end.line).saturating_add(end.column);
     Ok((start_char, end_char))
 }
 
+#[allow(dead_code)]
 fn point_for_position_bytes(rope: &Rope, pos: Position) -> Point {
     let line_start_char = rope.line_to_char(pos.line);
     let abs_char = line_start_char.saturating_add(pos.column);
@@ -360,4 +401,9 @@ fn add_text_to_point(start: Point, new_bytes: &[u8]) -> Point {
         if b == b'\n' { rows += 1; col = 0; } else { col += 1; }
     }
     Point::new(start.row + rows, col)
+}
+
+fn is_valid_byte_boundary(rope: &Rope, byte: usize) -> bool {
+    let ch = rope.byte_to_char(byte);
+    rope.char_to_byte(ch) == byte
 }
