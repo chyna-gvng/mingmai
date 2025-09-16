@@ -1,37 +1,8 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema)]
-pub struct Position {
-    pub line: usize,
-    pub column: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct TextEdit {
-    pub start: Position,
-    pub end: Position,
-    pub new_text: String,
-}
-
-// Legacy type retained only for historical context; no longer used by tools.
-#[allow(dead_code)]
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct FileEditReq {
-    pub path: String,
-    pub edits: Vec<TextEdit>,
-}
-
-// Byte-accurate edit used for AST-based editing flows
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct ByteEdit {
-    pub start_byte: usize,
-    pub old_end_byte: usize,
-    pub new_text: String,
-}
-
 // -------------------------------
-// High-level edit model
+// High-level edit model (public API)
 // -------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -44,24 +15,10 @@ pub struct NodeRef {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Anchor {
-    NodeRef {
-        node_ref: NodeRef,
-    },
-    QueryCapture {
-        query: String,
-        capture_name: String,
-        #[serde(default)]
-        occurrence: usize,
-    },
-    LineColumn {
-        line: usize,
-        column: usize,
-    },
-    RegexMatch {
-        pattern: String,
-        #[serde(default)]
-        occurrence: usize,
-    },
+    NodeRef { node_ref: NodeRef },
+    QueryCapture { query: String, capture_name: String, #[serde(default)] occurrence: usize },
+    LineColumn { line: usize, column: usize },
+    RegexMatch { pattern: String, #[serde(default)] occurrence: usize },
 }
 
 #[allow(clippy::enum_variant_names)]
