@@ -3,17 +3,17 @@ use std::{env, path::PathBuf, sync::Arc};
 use anyhow::Result;
 use rmcp::service::ServiceExt;
 use tokio::signal;
-use tracing_subscriber::{fmt, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt};
 
-mod server;
-mod resource_store;
 mod edit;
 mod errors;
 mod events;
 mod parse_manager;
+mod resource_store;
+mod server;
 
-use server::MingmaiServer;
 use resource_store::ResourceStore;
+use server::MingmaiServer;
 
 #[tokio::main]
 async fn main() -> Result<()> {
