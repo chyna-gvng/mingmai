@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    edit::ByteEdit,
+    edit::{ByteEdit, Change},
     parse_manager::{GrammarInfo, LanguageManager, ParseManager},
     resource_store::{ResourceInfo, ResourceStore},
 };
@@ -232,6 +232,29 @@ pub struct AstEditResult {
     pub preview: Option<EditPreview>,
 }
 
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct AstApplyChangesReq {
+    pub path: String,
+    pub changes: Vec<Change>,
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default = "default_true")]
+    pub enforce_parse: bool,
+    #[serde(default = "default_true")]
+    pub create_backup: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Clone)]
+pub struct AstApplyChangesResult {
+    pub applied: bool,
+    #[serde(default)]
+    pub preview: Option<EditPreview>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backup_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<Vec<SyntaxErrorSpan>>,
+}
+
 #[tool_router]
 impl MingmaiServer {
     pub fn new(store: Arc<ResourceStore>) -> Self {
@@ -373,7 +396,7 @@ impl MingmaiServer {
         }
     }
 
-    // AST / Parsing tools
+    // AST / Parsing tools (legacy low-level byte edits)
     #[rmcp::tool(
         description = "Apply byte-accurate edits; validates bounds and file existence. Use dry_run=true for a preview."
     )]
@@ -407,23 +430,48 @@ impl MingmaiServer {
         }
         match self
             .store
-            .apply_byte_edits_with_opts(
+            .apply_byte_edits_with_validation(
                 Path::new(&req.path),
                 req.edits,
-                req.truncate_tail,
-                req.validate_utf8,
+                /*enforce_parse=*/ true,
+                /*create_backup=*/ true,
+                /*validate_utf8=*/ req.validate_utf8,
+                /*truncate_tail=*/ req.truncate_tail,
             )
             .await
         {
-            Ok(_) => {
-                // Best-effort parse update; do not fail the call if parse fails
-                let pm = ParseManager::new(self.store.clone());
-                let _ = pm.parse_now(Path::new(&req.path)).await;
-                Ok(Json(ok(AstEditResult {
-                    applied: true,
-                    preview: None,
-                })))
-            }
+            Ok(_) => Ok(Json(ok(AstEditResult {
+                applied: true,
+                preview: None,
+            }))),
+            Err(e) => Ok(Json(err(
+                "invalid_params",
+                format!("{} (path={})", e, req.path),
+            ))),
+        }
+    }
+
+    // New high-level change application API
+    #[rmcp::tool(
+        description = "Apply high-level AST changes (anchors/queries/nodes); server computes byte edits and validates parse before commit."
+    )]
+    pub async fn ast_apply_changes(
+        &self,
+        params: Parameters<AstApplyChangesReq>,
+    ) -> Result<Json<Envelope<AstApplyChangesResult>>, ErrorData> {
+        let req = params.0;
+        match self
+            .store
+            .apply_changes(
+                Path::new(&req.path),
+                req.changes,
+                req.dry_run,
+                req.enforce_parse,
+                req.create_backup,
+            )
+            .await
+        {
+            Ok(res) => Ok(Json(ok(res))),
             Err(e) => Ok(Json(err(
                 "invalid_params",
                 format!("{} (path={})", e, req.path),
