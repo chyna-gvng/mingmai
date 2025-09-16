@@ -8,7 +8,7 @@ use tokio::{fs as tokio_fs, sync::{RwLock, Mutex}, task, time::{sleep, Duration}
 use tracing::{info, error};
 use tree_sitter::{InputEdit, Point, Tree};
 
-use crate::{edit::{TextEdit, Position}, events::ResourceEvent};
+use crate::{edit::{TextEdit, Position, ByteEdit}, events::ResourceEvent};
 
 #[derive(Clone)]
 pub struct ResourceStore {
@@ -107,6 +107,7 @@ impl ResourceStore {
     }
 
     // Apply edits and compute corresponding tree-sitter InputEdits in descending order.
+    // Legacy line/column edit path; kept for compatibility with older clients
     pub async fn apply_edits(&self, path: &Path, mut edits: Vec<TextEdit>) -> Result<()> {
         let rf = self.open_or_load(path).await?;
         let input_edits = {
@@ -171,6 +172,54 @@ impl ResourceStore {
         } else {
             let _ = self.events.send(ResourceEvent::Edited(abs, input_edits));
         }
+        Ok(())
+    }
+
+    pub async fn apply_byte_edits(&self, path: &Path, mut edits: Vec<ByteEdit>) -> Result<()> {
+        let rf = self.open_or_load(path).await?;
+        let input_edits = {
+            let mut file = rf.write().await;
+            // Normalize to descending by start_byte
+            edits.sort_by(|a, b| b.start_byte.cmp(&a.start_byte));
+            let mut ies: Vec<InputEdit> = Vec::with_capacity(edits.len());
+            for e in edits.iter() {
+                // Compute Points for old range using current rope
+                let start_point = point_for_byte(&file.rope, e.start_byte);
+                let old_end_point = point_for_byte(&file.rope, e.old_end_byte);
+                let new_end_byte = e.start_byte + e.new_text.as_bytes().len();
+                let new_end_point = add_text_to_point(start_point, e.new_text.as_bytes());
+                ies.push(InputEdit {
+                    start_byte: e.start_byte,
+                    old_end_byte: e.old_end_byte,
+                    new_end_byte,
+                    start_position: start_point,
+                    old_end_position: old_end_point,
+                    new_end_position: new_end_point,
+                });
+            }
+
+            // Apply to tree first
+            if let Some(tree) = &mut file.tree {
+                for ie in ies.iter() {
+                    tree.edit(ie);
+                }
+            }
+            // Then apply to rope
+            for e in edits.into_iter() {
+                // Convert byte offsets to char indices for Ropey
+                let start_char = file.rope.byte_to_char(e.start_byte);
+                let old_end_char = file.rope.byte_to_char(e.old_end_byte);
+                file.rope.remove(start_char..old_end_char);
+                file.rope.insert(start_char, &e.new_text);
+            }
+
+            file.version = file.version.saturating_add(1);
+            file.dirty.store(true, Ordering::SeqCst);
+            self.schedule_persist_unlocked(&rf);
+            ies
+        };
+        let abs = self.ensure_within_root(path)?;
+        let _ = self.events.send(ResourceEvent::Edited(abs, input_edits));
         Ok(())
     }
 
@@ -293,6 +342,15 @@ fn point_for_position_bytes(rope: &Rope, pos: Position) -> Point {
     let abs_byte = rope.char_to_byte(abs_char);
     let line_start_byte = rope.char_to_byte(line_start_char);
     Point::new(pos.line, abs_byte - line_start_byte)
+}
+
+fn point_for_byte(rope: &Rope, byte: usize) -> Point {
+    let char_idx = rope.byte_to_char(byte);
+    let line = rope.char_to_line(char_idx);
+    let line_start_char = rope.line_to_char(line);
+    let line_start_byte = rope.char_to_byte(line_start_char);
+    let col_bytes = byte.saturating_sub(line_start_byte);
+    Point::new(line, col_bytes)
 }
 
 fn add_text_to_point(start: Point, new_bytes: &[u8]) -> Point {
