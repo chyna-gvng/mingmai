@@ -9,7 +9,7 @@ use rmcp::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::{resource_store::{ResourceStore, ResourceInfo}, edit::ByteEdit, parse_manager::ParseManager};
+use crate::{resource_store::{ResourceStore, ResourceInfo}, edit::ByteEdit, parse_manager::{ParseManager, LanguageManager, GrammarInfo}};
 
 #[derive(Clone)]
 pub struct MingmaiServer {
@@ -33,7 +33,13 @@ pub struct ListReq { #[serde(default)] pub path: String, #[serde(default)] pub r
 pub struct ParseReq { pub path: String }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-pub struct AstEditReq { pub path: String, pub edits: Vec<ByteEdit> }
+pub struct AstEditReq {
+    pub path: String,
+    pub edits: Vec<ByteEdit>,
+    #[serde(default)] pub truncate_tail: bool,
+    #[serde(default)] pub dry_run: bool,
+    #[serde(default = "default_true")] pub validate_utf8: bool,
+}
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct AstQueryReq {
@@ -94,7 +100,22 @@ pub struct FileViewResult { pub path: String, pub content: String }
 pub struct ListResourcesResult { pub items: Vec<ResourceInfo> }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub struct ParseResult { pub ok: bool, pub has_tree: bool }
+pub struct ParseResult {
+    pub ok: bool,
+    pub has_tree: bool,
+    pub exists: bool,
+    pub language_detected: Option<String>,
+    pub error_count: Option<usize>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ListGrammarsResult { pub grammars: Vec<GrammarInfo> }
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct EditPreview { pub final_len_bytes: usize }
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct AstEditResult { pub ok: bool, #[serde(default)] pub preview: Option<EditPreview> }
 
 #[tool_router]
 impl MingmaiServer {
@@ -121,6 +142,10 @@ impl MingmaiServer {
     #[rmcp::tool(description = "Delete a directory under the workspace root")]
     pub async fn workspace_delete(&self, params: Parameters<PathOnly>) -> Result<Json<OkResponse>, ErrorData> {
         let path = params.0.path;
+        // Safeguard: disallow deleting root without explicit force flag in path string (e.g., "/" or empty)
+        if path.trim().is_empty() || path == "." || path == "/" {
+            return Err(ErrorData::invalid_params("Refusing to delete workspace root without explicit path", None));
+        }
         self.store
             .delete_dir(Path::new(&path))
             .await
@@ -163,16 +188,23 @@ impl MingmaiServer {
     // NOTE: The legacy line/column `file_edit` tool has been removed in favor of AST-based byte edits.
 
     #[rmcp::tool(description = "Apply byte-accurate AST edits to a file")]
-    pub async fn ast_edit(&self, params: Parameters<AstEditReq>) -> Result<Json<OkResponse>, ErrorData> {
+    pub async fn ast_edit(&self, params: Parameters<AstEditReq>) -> Result<Json<AstEditResult>, ErrorData> {
         let req = params.0;
+        if req.dry_run {
+            let final_len = self.store
+                .apply_byte_edits_preview(Path::new(&req.path), req.edits.clone(), req.truncate_tail, req.validate_utf8)
+                .await
+                .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+            return Ok(Json(AstEditResult { ok: true, preview: Some(EditPreview { final_len_bytes: final_len }) }));
+        }
         self.store
-            .apply_byte_edits(Path::new(&req.path), req.edits)
+            .apply_byte_edits_with_opts(Path::new(&req.path), req.edits, req.truncate_tail, req.validate_utf8)
             .await
             .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
         // After byte edits, parse to maintain updated tree snapshot
         let pm = ParseManager::new(self.store.clone());
         let _ = pm.parse_now(Path::new(&req.path)).await.map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-        Ok(Json(OkResponse { ok: true }))
+        Ok(Json(AstEditResult { ok: true, preview: None }))
     }
 
     #[rmcp::tool(description = "List resources under a path (relative to workspace root)")]
@@ -194,7 +226,24 @@ impl MingmaiServer {
         let tree = pm.parse_now(Path::new(&req.path))
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-        Ok(Json(ParseResult { ok: true, has_tree: tree.is_some() }))
+        let (abs, _rope, _old_tree, _version) = self.store.snapshot(Path::new(&req.path))
+            .await
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let exists = abs.exists();
+        let language_detected = LanguageManager::language_for_path(&abs).map(|(id, _)| match id {
+            crate::parse_manager::LanguageId::Rust => "rust".to_string(),
+            crate::parse_manager::LanguageId::Javascript => "javascript".to_string(),
+            crate::parse_manager::LanguageId::Typescript => "typescript".to_string(),
+            crate::parse_manager::LanguageId::Tsx => "tsx".to_string(),
+            crate::parse_manager::LanguageId::Python => "python".to_string(),
+            crate::parse_manager::LanguageId::Bash => "bash".to_string(),
+            crate::parse_manager::LanguageId::Html => "html".to_string(),
+        });
+        let error_count = tree.as_ref().map(|t| {
+            let root = t.root_node();
+            count_error_nodes(root)
+        });
+        Ok(Json(ParseResult { ok: true, has_tree: tree.is_some(), exists, language_detected, error_count }))
     }
 
     #[rmcp::tool(description = "Run a Tree-sitter query and return captures")]
@@ -211,7 +260,7 @@ impl MingmaiServer {
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         // Get language
-        let Some((_id, lang)) = crate::parse_manager::LanguageManager::language_for_path(&abs) else {
+        let Some((_id, lang)) = LanguageManager::language_for_path(&abs) else {
             return Err(ErrorData::invalid_params("Unsupported language for path", None));
         };
         let query = Query::new(&lang, &req.query)
@@ -243,14 +292,13 @@ impl MingmaiServer {
 
     #[rmcp::tool(description = "Get the smallest node at a byte offset")]
     pub async fn ast_node_at(&self, params: Parameters<AstNodeAtReq>) -> Result<Json<AstNodeOut>, ErrorData> {
-        // no-op
         let req = params.0;
         let pm = ParseManager::new(self.store.clone());
         let tree = pm.parse_now(Path::new(&req.path))
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
             .ok_or_else(|| ErrorData::resource_not_found("No parse tree available", None))?;
-        let (abs, rope, _old_tree, _version) = self.store.snapshot(Path::new(&req.path))
+        let (_abs, rope, _old_tree, _version) = self.store.snapshot(Path::new(&req.path))
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         let text = rope.to_string();
@@ -278,22 +326,41 @@ impl MingmaiServer {
             .ok_or_else(|| ErrorData::resource_not_found("No parse tree available", None))?;
         Ok(Json(AstGetTreeResult { sexp: tree.root_node().to_sexp() }))
     }
+
+    #[rmcp::tool(description = "List supported grammars at runtime")]
+    pub async fn list_grammars(&self, _params: Parameters<PingReq>) -> Result<Json<ListGrammarsResult>, ErrorData> {
+        Ok(Json(ListGrammarsResult { grammars: LanguageManager::list_grammars() }))
+    }
+}
+
+fn count_error_nodes(root: tree_sitter::Node) -> usize {
+    let mut count = 0usize;
+    let cursor = root.walk();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.is_error() || node.is_missing() || node.kind() == "ERROR" { count += 1; }
+        for i in 0..node.child_count() {
+            if let Some(ch) = node.child(i) { stack.push(ch); }
+        }
+    }
+    drop(cursor);
+    count
 }
 
 #[rmcp::tool_handler]
 impl ServerHandler for MingmaiServer {
     fn get_info(&self) -> ServerInfo {
-        let mut info = ServerInfo::default();
-        info.instructions = Some("Headless IDE for LLMs over MCP".into());
-        // Advertise capabilities so hosts know tools/resources exist
-        info.capabilities = rmcp::model::ServerCapabilities::builder()
-            .enable_logging()
-            .enable_tools()
-            .enable_tool_list_changed()
-            .enable_resources()
-            .enable_resources_list_changed()
-            .build();
-        info
+        ServerInfo {
+            instructions: Some("Headless IDE for LLMs over MCP".into()),
+            capabilities: rmcp::model::ServerCapabilities::builder()
+                .enable_logging()
+                .enable_tools()
+                .enable_tool_list_changed()
+                .enable_resources()
+                .enable_resources_list_changed()
+                .build(),
+            ..ServerInfo::default()
+        }
     }
 
     fn set_level(
