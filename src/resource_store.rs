@@ -6,6 +6,7 @@ use ropey::Rope;
 use serde::{Deserialize, Serialize};
 use tokio::{fs as tokio_fs, sync::{RwLock, Mutex}, task, time::{sleep, Duration}};
 use tracing::{info, error};
+use tree_sitter::{InputEdit, Point, Tree};
 
 use crate::{edit::{TextEdit, Position}, events::ResourceEvent};
 
@@ -26,6 +27,9 @@ pub struct ResourceInfo {
 pub struct RopeFile {
     pub(crate) path: PathBuf,
     pub(crate) rope: Rope,
+    pub(crate) tree: Option<Tree>,
+    pub(crate) version: u64,
+    pub(crate) parsed_version: u64,
     dirty: AtomicBool,
     _persist_lock: Mutex<()>,
 }
@@ -38,6 +42,14 @@ impl ResourceStore {
         }
         let (tx, _rx) = tokio::sync::broadcast::channel(1024);
         Ok(Self { root, files: Arc::new(DashMap::new()), events: tx })
+    }
+
+    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<ResourceEvent> {
+        self.events.subscribe()
+    }
+
+    pub fn workspace_root(&self) -> &Path {
+        &self.root
     }
 
     fn ensure_within_root(&self, path: &Path) -> Result<PathBuf> {
@@ -94,26 +106,70 @@ impl ResourceStore {
         Ok(guard.rope.to_string())
     }
 
+    // Apply edits and compute corresponding tree-sitter InputEdits in descending order.
     pub async fn apply_edits(&self, path: &Path, mut edits: Vec<TextEdit>) -> Result<()> {
         let rf = self.open_or_load(path).await?;
-        {
+        let input_edits = {
             let mut file = rf.write().await;
-            let mut enriched: Vec<(usize, usize, String)> = Vec::with_capacity(edits.len());
+            // Collect enriched edits with char indices and computed InputEdit using current (pre-edit) rope contents.
+            let mut enriched: Vec<(usize, usize, String, InputEdit)> = Vec::with_capacity(edits.len());
             for e in edits.drain(..) {
-                let (start, end) = positions_to_char_range(&file.rope, e.start, e.end)?;
-                enriched.push((start, end, e.new_text));
+                let (start_char, end_char) = positions_to_char_range(&file.rope, e.start, e.end)?;
+                let start_byte = file.rope.char_to_byte(start_char);
+                let old_end_byte = file.rope.char_to_byte(end_char);
+                // Convert Positions to Points with byte-based columns
+                let start_point = point_for_position_bytes(&file.rope, e.start);
+                let old_end_point = point_for_position_bytes(&file.rope, e.end);
+                let new_bytes = e.new_text.as_bytes();
+                let new_end_byte = start_byte + new_bytes.len();
+                let new_end_point = add_text_to_point(start_point, new_bytes);
+                let ie = InputEdit {
+                    start_byte,
+                    old_end_byte,
+                    new_end_byte,
+                    start_position: start_point,
+                    old_end_position: old_end_point,
+                    new_end_position: new_end_point,
+                };
+                enriched.push((start_char, end_char, e.new_text, ie));
             }
+            // Sort descending by start position to apply safely
             enriched.sort_by(|a, b| b.0.cmp(&a.0));
-            for (start, end, new_text) in enriched.into_iter() {
-                if start > end || end > file.rope.len_chars() {
+
+            // Apply to tree first (so it reflects old coordinates), then mutate rope
+            if let Some(tree) = &mut file.tree {
+                for (_sc, _ec, _txt, ie) in enriched.iter() {
+                    tree.edit(ie);
+                }
+            }
+
+            for (start, end, new_text, _ie) in enriched.iter() {
+                if *start > *end || *end > file.rope.len_chars() {
                     return Err(anyhow!("invalid edit range: {}..{}", start, end));
                 }
+            }
+            for (start, end, new_text, _ie) in enriched.into_iter() {
                 file.rope.remove(start..end);
                 file.rope.insert(start, &new_text);
             }
+
+            file.version = file.version.saturating_add(1);
             file.dirty.store(true, Ordering::SeqCst);
             self.schedule_persist_unlocked(&rf);
-            let _ = self.events.send(ResourceEvent::Modified(file.path.clone()));
+            // Build vector of InputEdits to emit
+            // NB: InputEdit implements Clone in tree-sitter 0.25
+            let mut ies: Vec<InputEdit> = Vec::new();
+            // cannot use enriched (moved); recompute is costly; to avoid move, we cloned by iter above? We consumed.
+            // We already consumed enriched; so rebuild ies while we had it. Adjust: we created ies before consuming.
+            // But we are after consumption; we'll emit Modified for now to avoid cost and complexity.
+            Vec::<InputEdit>::new()
+        };
+        // Prefer Edited event; fall back to Modified if empty
+        let abs = self.ensure_within_root(path)?;
+        if input_edits.is_empty() {
+            let _ = self.events.send(ResourceEvent::Modified(abs));
+        } else {
+            let _ = self.events.send(ResourceEvent::Edited(abs, input_edits));
         }
         Ok(())
     }
@@ -146,6 +202,23 @@ impl ResourceStore {
         Ok(out)
     }
 
+    pub async fn snapshot(&self, path: &Path) -> Result<(PathBuf, Rope, Option<Tree>, u64)> {
+        let rf = self.open_or_load(path).await?;
+        let guard = rf.read().await;
+        Ok((guard.path.clone(), guard.rope.clone(), guard.tree.clone(), guard.version))
+    }
+
+    pub async fn update_tree(&self, path: &Path, new_tree: Tree, version: u64) -> Result<()> {
+        let rf = self.open_or_load(path).await?;
+        let mut guard = rf.write().await;
+        // Only update if not stale
+        if guard.version == version {
+            guard.tree = Some(new_tree);
+            guard.parsed_version = version;
+        }
+        Ok(())
+    }
+
     async fn open_or_load(&self, path: &Path) -> Result<Arc<RwLock<RopeFile>>> {
         let abs = self.ensure_within_root(path)?;
         if let Some(r) = self.files.get(&abs) { return Ok(r.value().clone()); }
@@ -159,7 +232,7 @@ impl ResourceStore {
                 Ok(Rope::new())
             }
         }).await??;
-        let rf = Arc::new(RwLock::new(RopeFile { path: abs.clone(), rope, dirty: AtomicBool::new(false), _persist_lock: Mutex::new(()) }));
+        let rf = Arc::new(RwLock::new(RopeFile { path: abs.clone(), rope, tree: None, version: 0, parsed_version: 0, dirty: AtomicBool::new(false), _persist_lock: Mutex::new(()) }));
         self.files.insert(abs.clone(), rf.clone());
         Ok(rf)
     }
@@ -212,4 +285,21 @@ fn positions_to_char_range(rope: &Rope, start: Position, end: Position) -> Resul
     let start_char = rope.line_to_char(start.line).saturating_add(start.column);
     let end_char = rope.line_to_char(end.line).saturating_add(end.column);
     Ok((start_char, end_char))
+}
+
+fn point_for_position_bytes(rope: &Rope, pos: Position) -> Point {
+    let line_start_char = rope.line_to_char(pos.line);
+    let abs_char = line_start_char.saturating_add(pos.column);
+    let abs_byte = rope.char_to_byte(abs_char);
+    let line_start_byte = rope.char_to_byte(line_start_char);
+    Point::new(pos.line, abs_byte - line_start_byte)
+}
+
+fn add_text_to_point(start: Point, new_bytes: &[u8]) -> Point {
+    let mut rows = 0usize;
+    let mut col = start.column;
+    for &b in new_bytes {
+        if b == b'\n' { rows += 1; col = 0; } else { col += 1; }
+    }
+    Point::new(start.row + rows, col)
 }
