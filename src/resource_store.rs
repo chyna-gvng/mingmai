@@ -1,7 +1,7 @@
 use std::{
     collections::VecDeque,
     fs,
-    io::{BufReader, BufWriter},
+    io::{BufReader, BufWriter, Write},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -20,11 +20,12 @@ use tokio::{
     time::{Duration, sleep},
 };
 use tracing::{error, info};
-use tree_sitter::{InputEdit, Point, Tree};
+use tree_sitter::{InputEdit, Parser, Point, Tree};
 
 use crate::{
-    edit::{ByteEdit, Position, TextEdit},
+    edit::{Anchor, ByteEdit, Change, Position, TextEdit},
     events::ResourceEvent,
+    parse_manager::LanguageManager,
 };
 
 #[derive(Clone)]
@@ -39,6 +40,22 @@ pub struct ResourceInfo {
     pub path: String,
     pub is_dir: bool,
     pub size: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SyntaxDiag {
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub kind: String,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct ChangeApplyOutcome {
+    pub applied: bool,
+    pub preview_len_bytes: Option<usize>,
+    pub backup_id: Option<String>,
+    pub diagnostics: Vec<SyntaxDiag>,
 }
 
 pub struct RopeFile {
@@ -517,6 +534,447 @@ impl ResourceStore {
             }
         });
     }
+
+    // -------------------------------
+    // New high-level change pipeline
+    // -------------------------------
+
+    pub async fn apply_changes(
+        &self,
+        path: &Path,
+        changes: Vec<Change>,
+        dry_run: bool,
+        enforce_parse: bool,
+        create_backup: bool,
+    ) -> Result<crate::server::AstApplyChangesResult> {
+        let abs = self.ensure_within_root(path)?;
+        if !abs.exists() {
+            return Err(anyhow!("file not found: {}", abs.display()));
+        }
+        let rf = self.open_or_load(path).await?;
+        // Snapshot
+        let (orig_rope, orig_tree, version) = {
+            let guard = rf.read().await;
+            (guard.rope.clone(), guard.tree.clone(), guard.version)
+        };
+
+        // Resolve high-level changes to byte edits
+        let mut byte_edits: Vec<ByteEdit> = Vec::new();
+        for ch in changes.iter() {
+            match ch {
+                Change::ReplaceNode { anchor, new_text } => {
+                    let (start, end) = self
+                        .resolve_anchor(&abs, &orig_rope, orig_tree.as_ref(), anchor)
+                        .await?;
+                    byte_edits.push(ByteEdit {
+                        start_byte: start,
+                        old_end_byte: end,
+                        new_text: new_text.clone(),
+                    });
+                }
+                Change::InsertBefore { anchor, new_text } => {
+                    let (start, _end) = self
+                        .resolve_anchor(&abs, &orig_rope, orig_tree.as_ref(), anchor)
+                        .await?;
+                    byte_edits.push(ByteEdit {
+                        start_byte: start,
+                        old_end_byte: start,
+                        new_text: new_text.clone(),
+                    });
+                }
+                Change::InsertAfter { anchor, new_text } => {
+                    let (_start, end) = self
+                        .resolve_anchor(&abs, &orig_rope, orig_tree.as_ref(), anchor)
+                        .await?;
+                    byte_edits.push(ByteEdit {
+                        start_byte: end,
+                        old_end_byte: end,
+                        new_text: new_text.clone(),
+                    });
+                }
+                Change::ReplaceRange { range, new_text } => {
+                    let (s, e) = self
+                        .resolve_range(&abs, &orig_rope, orig_tree.as_ref(), range)
+                        .await?;
+                    byte_edits.push(ByteEdit {
+                        start_byte: s,
+                        old_end_byte: e,
+                        new_text: new_text.clone(),
+                    });
+                }
+                Change::DeleteRange { range } => {
+                    let (s, e) = self
+                        .resolve_range(&abs, &orig_rope, orig_tree.as_ref(), range)
+                        .await?;
+                    byte_edits.push(ByteEdit {
+                        start_byte: s,
+                        old_end_byte: e,
+                        new_text: String::new(),
+                    });
+                }
+            }
+        }
+
+        // Build normalized, descending edits and InputEdits, validate parse
+        let (ies, test_rope, new_tree_opt, diags) = self
+            .validate_on_clone(
+                &abs,
+                &orig_rope,
+                &orig_tree,
+                byte_edits.clone(),
+                enforce_parse,
+            )
+            .await?;
+
+        if dry_run {
+            return Ok(crate::server::AstApplyChangesResult {
+                applied: false,
+                preview: Some(crate::server::EditPreview {
+                    final_len_bytes: test_rope.len_bytes(),
+                }),
+                backup_id: None,
+                diagnostics: if diags.is_empty() {
+                    None
+                } else {
+                    Some(
+                        diags
+                            .into_iter()
+                            .map(|d| crate::server::SyntaxErrorSpan {
+                                start_byte: d.start_byte,
+                                end_byte: d.end_byte,
+                                kind: d.kind,
+                            })
+                            .collect(),
+                    )
+                },
+            });
+        }
+
+        if enforce_parse && !diags.is_empty() {
+            return Ok(crate::server::AstApplyChangesResult {
+                applied: false,
+                preview: None,
+                backup_id: None,
+                diagnostics: Some(
+                    diags
+                        .into_iter()
+                        .map(|d| crate::server::SyntaxErrorSpan {
+                            start_byte: d.start_byte,
+                            end_byte: d.end_byte,
+                            kind: d.kind,
+                        })
+                        .collect(),
+                ),
+            });
+        }
+
+        // Commit: check version and apply
+        let mut file = rf.write().await;
+        if file.version != version {
+            return Err(anyhow!(
+                "concurrent_edit_conflict: file changed during validation"
+            ));
+        }
+
+        let mut backup_id: Option<String> = None;
+        if create_backup {
+            let old_bytes = orig_rope.to_string();
+            backup_id = Some(self.write_backup(&abs, old_bytes.as_bytes()).await?);
+        }
+
+        // Apply to real rope
+        file.rope = test_rope;
+        if let Some(nt) = new_tree_opt {
+            file.tree = Some(nt);
+        }
+        file.version = file.version.saturating_add(1);
+        file.dirty.store(true, Ordering::SeqCst);
+        let ies_clone = ies.clone();
+        self.schedule_persist_unlocked(&rf);
+        drop(file);
+
+        let _ = self
+            .events
+            .send(ResourceEvent::Edited(abs.clone(), ies_clone));
+
+        Ok(crate::server::AstApplyChangesResult {
+            applied: true,
+            preview: None,
+            backup_id,
+            diagnostics: None,
+        })
+    }
+
+    pub async fn apply_byte_edits_with_validation(
+        &self,
+        path: &Path,
+        edits: Vec<ByteEdit>,
+        enforce_parse: bool,
+        create_backup: bool,
+        validate_utf8: bool,
+        truncate_tail: bool,
+    ) -> Result<()> {
+        let abs = self.ensure_within_root(path)?;
+        if !abs.exists() {
+            return Err(anyhow!("file not found: {}", abs.display()));
+        }
+        let rf = self.open_or_load(path).await?;
+        let (orig_rope, orig_tree, version) = {
+            let g = rf.read().await;
+            (g.rope.clone(), g.tree.clone(), g.version)
+        };
+        // Validate offsets and normalize
+        let file_len = orig_rope.len_bytes();
+        let mut norm: Vec<ByteEdit> = Vec::with_capacity(edits.len());
+        for e in edits.into_iter() {
+            if e.start_byte > e.old_end_byte {
+                return Err(anyhow!(
+                    "start_byte {} must be <= old_end_byte {}",
+                    e.start_byte,
+                    e.old_end_byte
+                ));
+            }
+            if e.old_end_byte > file_len || e.start_byte > file_len {
+                return Err(anyhow!(
+                    "byte range {}..{} exceeds file size {}",
+                    e.start_byte,
+                    e.old_end_byte,
+                    file_len
+                ));
+            }
+            if validate_utf8
+                && (!is_valid_byte_boundary(&orig_rope, e.start_byte)
+                    || !is_valid_byte_boundary(&orig_rope, e.old_end_byte))
+            {
+                return Err(anyhow!("byte offsets are not valid UTF-8 boundaries"));
+            }
+            norm.push(e);
+        }
+        if truncate_tail {
+            let max_old = norm.iter().map(|e| e.old_end_byte).max().unwrap_or(0);
+            if max_old < file_len {
+                norm.push(ByteEdit {
+                    start_byte: max_old,
+                    old_end_byte: file_len,
+                    new_text: String::new(),
+                });
+            }
+        }
+        // Validate and prepare
+        let (ies, test_rope, new_tree_opt, diags) = self
+            .validate_on_clone(&abs, &orig_rope, &orig_tree, norm.clone(), enforce_parse)
+            .await?;
+        if enforce_parse && !diags.is_empty() {
+            return Err(anyhow!("parse_rejected: {} errors", diags.len()));
+        }
+        // Commit with version check
+        let mut file = rf.write().await;
+        if file.version != version {
+            return Err(anyhow!(
+                "concurrent_edit_conflict: file changed during validation"
+            ));
+        }
+        if create_backup {
+            let old_bytes = orig_rope.to_string();
+            let _ = self.write_backup(&abs, old_bytes.as_bytes()).await?;
+        }
+        file.rope = test_rope;
+        if let Some(nt) = new_tree_opt {
+            file.tree = Some(nt);
+        }
+        file.version = file.version.saturating_add(1);
+        file.dirty.store(true, Ordering::SeqCst);
+        let ies_clone = ies.clone();
+        self.schedule_persist_unlocked(&rf);
+        drop(file);
+        let _ = self
+            .events
+            .send(ResourceEvent::Edited(abs.clone(), ies_clone));
+        Ok(())
+    }
+
+    async fn resolve_anchor(
+        &self,
+        abs: &Path,
+        rope: &Rope,
+        old_tree: Option<&Tree>,
+        anchor: &Anchor,
+    ) -> Result<(usize, usize)> {
+        match anchor {
+            Anchor::LineColumn { line, column } => {
+                let start_char = rope.line_to_char(*line).saturating_add(*column);
+                let b = rope.char_to_byte(start_char);
+                Ok((b, b))
+            }
+            Anchor::RegexMatch {
+                pattern,
+                occurrence,
+            } => {
+                let text = rope.to_string();
+                let re = regex::Regex::new(pattern).map_err(|e| anyhow!("invalid regex: {e}"))?;
+                for (i, m) in re.find_iter(text.as_str()).enumerate() {
+                    if i == *occurrence {
+                        return Ok((m.start(), m.end()));
+                    }
+                }
+                Err(anyhow!("regex match not found"))
+            }
+            Anchor::QueryCapture {
+                query,
+                capture_name,
+                occurrence,
+            } => {
+                let Some((_id, lang)) = LanguageManager::language_for_path(abs) else {
+                    return Err(anyhow!("unsupported language for path"));
+                };
+                let mut parser = Parser::new();
+                parser
+                    .set_language(&lang)
+                    .map_err(|e| anyhow!("language error: {e:?}"))?;
+                let text = rope.to_string();
+                let tree = parser
+                    .parse(text.as_bytes(), old_tree)
+                    .ok_or_else(|| anyhow!("parse failed"))?;
+                use tree_sitter::{Query, QueryCursor, StreamingIterator};
+                let q = Query::new(&lang, query).map_err(|e| anyhow!("query error: {e:?}"))?;
+                let mut cursor = QueryCursor::new();
+                let mut it = cursor.captures(&q, tree.root_node(), text.as_bytes());
+                let mut idx = 0usize;
+                loop {
+                    it.next();
+                    if let Some((m, cap_ix)) = it.get() {
+                        let cap = m.captures[*cap_ix];
+                        let name = q.capture_names()[cap.index as usize].to_string();
+                        if name == *capture_name {
+                            if idx == *occurrence {
+                                return Ok((cap.node.start_byte(), cap.node.end_byte()));
+                            }
+                            idx += 1;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                Err(anyhow!("query capture not found"))
+            }
+            Anchor::NodeRef { node_ref } => {
+                // Simple token format (for now): "start:end[:version]"
+                let parts: Vec<&str> = node_ref.token.split(':').collect();
+                if parts.len() < 2 {
+                    return Err(anyhow!("invalid node_ref token"));
+                }
+                let start: usize = parts[0]
+                    .parse()
+                    .map_err(|_| anyhow!("invalid node_ref token"))?;
+                let end: usize = parts[1]
+                    .parse()
+                    .map_err(|_| anyhow!("invalid node_ref token"))?;
+                Ok((start, end))
+            }
+        }
+    }
+
+    async fn resolve_range(
+        &self,
+        abs: &Path,
+        rope: &Rope,
+        old_tree: Option<&Tree>,
+        range: &crate::edit::RangeSpec,
+    ) -> Result<(usize, usize)> {
+        match range {
+            crate::edit::RangeSpec::ByteRange {
+                start_byte,
+                end_byte,
+            } => Ok((*start_byte, *end_byte)),
+            crate::edit::RangeSpec::LineRange {
+                start_line,
+                end_line,
+            } => {
+                let sc = rope.line_to_char(*start_line);
+                let ec = rope.line_to_char(*end_line);
+                Ok((rope.char_to_byte(sc), rope.char_to_byte(ec)))
+            }
+            crate::edit::RangeSpec::NodeRange { anchor } => {
+                // anchor is NodeRef
+                self.resolve_anchor(
+                    abs,
+                    rope,
+                    old_tree,
+                    &Anchor::NodeRef {
+                        node_ref: anchor.clone(),
+                    },
+                )
+                .await
+            }
+        }
+    }
+
+    async fn validate_on_clone(
+        &self,
+        abs: &Path,
+        orig_rope: &Rope,
+        orig_tree: &Option<Tree>,
+        mut edits: Vec<ByteEdit>,
+        enforce_parse: bool,
+    ) -> Result<(Vec<InputEdit>, Rope, Option<Tree>, Vec<SyntaxDiag>)> {
+        // Sort descending by start_byte
+        edits.sort_by(|a, b| b.start_byte.cmp(&a.start_byte));
+        // Compute InputEdits relative to original
+        let mut ies: Vec<InputEdit> = Vec::with_capacity(edits.len());
+        for e in edits.iter() {
+            let start_point = point_for_byte(orig_rope, e.start_byte);
+            let old_end_point = point_for_byte(orig_rope, e.old_end_byte);
+            let new_end_byte = e.start_byte + e.new_text.len();
+            let new_end_point = add_text_to_point(start_point, e.new_text.as_bytes());
+            ies.push(InputEdit {
+                start_byte: e.start_byte,
+                old_end_byte: e.old_end_byte,
+                new_end_byte,
+                start_position: start_point,
+                old_end_position: old_end_point,
+                new_end_position: new_end_point,
+            });
+        }
+        // Apply to clone
+        let mut test_rope = orig_rope.clone();
+        let mut test_tree = orig_tree.clone();
+        if let Some(t) = &mut test_tree {
+            for ie in ies.iter() {
+                t.edit(ie);
+            }
+        }
+        for e in edits.into_iter() {
+            let sc = test_rope.byte_to_char(e.start_byte);
+            let oc = test_rope.byte_to_char(e.old_end_byte);
+            test_rope.remove(sc..oc);
+            test_rope.insert(sc, &e.new_text);
+        }
+        // Optionally parse
+        let mut diags: Vec<SyntaxDiag> = Vec::new();
+        let mut new_tree_opt: Option<Tree> = None;
+        if enforce_parse && let Some((_id, lang)) = LanguageManager::language_for_path(abs) {
+            let mut parser = Parser::new();
+            parser
+                .set_language(&lang)
+                .map_err(|e| anyhow!("language error: {e:?}"))?;
+            let text = test_rope.to_string();
+            let parsed = task::spawn_blocking(move || parser.parse(text.as_bytes(), test_tree.as_ref()))
+                .await?;
+            if let Some(ntree) = parsed.clone() {
+                let root = ntree.root_node();
+                diags = collect_error_diags(root);
+                new_tree_opt = Some(ntree);
+            } else {
+                diags.push(SyntaxDiag {
+                    start_byte: 0,
+                    end_byte: 0,
+                    kind: "parse_failed".into(),
+                });
+            }
+        }
+
+        Ok((ies, test_rope, new_tree_opt, diags))
+    }
 }
 
 async fn persist_rope(path: &Path, rope: &Rope) -> Result<()> {
@@ -526,9 +984,18 @@ async fn persist_rope(path: &Path, rope: &Rope) -> Result<()> {
     let rope = rope.clone();
     let path = path.to_path_buf();
     task::spawn_blocking(move || -> Result<()> {
-        let f = fs::File::create(&path).with_context(|| format!("create {}", path.display()))?;
-        let mut writer = BufWriter::new(f);
-        rope.write_to(&mut writer).context("rope write")?;
+        let parent = path.parent().ok_or_else(|| anyhow!("no parent for path"))?;
+        let mut tmp = tempfile::Builder::new()
+            .prefix(".mingmai.tmp-")
+            .tempfile_in(parent)
+            .context("tempfile create")?;
+        {
+            let mut writer = BufWriter::new(&mut tmp);
+            rope.write_to(&mut writer).context("rope write")?;
+            writer.flush().ok();
+        }
+        tmp.persist(&path)
+            .map_err(|e| anyhow!("atomic persist failed: {}", e))?;
         Ok(())
     })
     .await??;
@@ -585,4 +1052,59 @@ fn add_text_to_point(start: Point, new_bytes: &[u8]) -> Point {
 fn is_valid_byte_boundary(rope: &Rope, byte: usize) -> bool {
     let ch = rope.byte_to_char(byte);
     rope.char_to_byte(ch) == byte
+}
+
+fn collect_error_diags(root: tree_sitter::Node) -> Vec<SyntaxDiag> {
+    let mut out = Vec::new();
+    let cursor = root.walk();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.is_error() || node.is_missing() || node.kind() == "ERROR" {
+            out.push(SyntaxDiag {
+                start_byte: node.start_byte(),
+                end_byte: node.end_byte(),
+                kind: node.kind().to_string(),
+            });
+        }
+        for i in 0..node.child_count() {
+            if let Some(ch) = node.child(i) {
+                stack.push(ch);
+            }
+        }
+    }
+    drop(cursor);
+    out
+}
+
+impl ResourceStore {
+    async fn write_backup(&self, path: &Path, data: &[u8]) -> Result<String> {
+        let parent = path.parent().ok_or_else(|| anyhow!("no parent for path"))?;
+        let dir = parent.join(".mingmai").join("backups");
+        tokio_fs::create_dir_all(&dir).await?;
+        // build id as sha256 hex
+        let mut hasher = sha2::Sha256::new();
+        use sha2::Digest;
+        hasher.update(data);
+        let id = hex::encode(hasher.finalize());
+        // timestamp seconds
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let file = dir.join(format!("{}-{}.snap", ts, &id[..16]));
+        let outp = file.clone();
+        let buf = data.to_vec();
+        task::spawn_blocking(move || -> Result<()> {
+            let mut tmp = tempfile::Builder::new()
+                .prefix("backup-")
+                .tempfile_in(outp.parent().unwrap())
+                .context("backup tempfile")?;
+            tmp.write_all(&buf).context("backup write")?;
+            tmp.persist(&outp)
+                .map_err(|e| anyhow!("persist backup: {}", e))?;
+            Ok(())
+        })
+        .await??;
+        Ok(id)
+    }
 }
