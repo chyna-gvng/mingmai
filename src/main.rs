@@ -10,6 +10,7 @@ mod resource_store;
 mod edit;
 mod errors;
 mod events;
+mod parse_manager;
 
 use server::MingmaiServer;
 use resource_store::ResourceStore;
