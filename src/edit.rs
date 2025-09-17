@@ -15,10 +15,24 @@ pub struct NodeRef {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Anchor {
-    NodeRef { node_ref: NodeRef },
-    QueryCapture { query: String, capture_name: String, #[serde(default)] occurrence: usize },
-    LineColumn { line: usize, column: usize },
-    RegexMatch { pattern: String, #[serde(default)] occurrence: usize },
+    NodeRef {
+        node_ref: NodeRef,
+    },
+    QueryCapture {
+        query: String,
+        capture_name: String,
+        #[serde(default)]
+        occurrence: usize,
+    },
+    LineColumn {
+        line: usize,
+        column: usize,
+    },
+    RegexMatch {
+        pattern: String,
+        #[serde(default)]
+        occurrence: usize,
+    },
 }
 
 #[allow(clippy::enum_variant_names)]
