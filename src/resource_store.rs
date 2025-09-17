@@ -745,8 +745,9 @@ impl ResourceStore {
                 .set_language(&lang)
                 .map_err(|e| anyhow!("language error: {e:?}"))?;
             let text = test_rope.to_string();
-            let parsed = task::spawn_blocking(move || parser.parse(text.as_bytes(), test_tree.as_ref()))
-                .await?;
+            let parsed =
+                task::spawn_blocking(move || parser.parse(text.as_bytes(), test_tree.as_ref()))
+                    .await?;
             if let Some(ntree) = parsed.clone() {
                 let root = ntree.root_node();
                 diags = collect_error_diags(root);
@@ -796,7 +797,6 @@ fn canonicalize(p: &Path) -> Result<PathBuf> {
         Ok(p.to_path_buf())
     }
 }
-
 
 fn point_for_byte(rope: &Rope, byte: usize) -> Point {
     let char_idx = rope.byte_to_char(byte);
