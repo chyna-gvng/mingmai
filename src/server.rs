@@ -1,3 +1,4 @@
+
 use std::{collections::BTreeMap, path::Path, sync::Arc};
 
 use rmcp::{
@@ -22,6 +23,153 @@ const MAX_AST_BYTES: usize = 10 * 1024 * 1024; // 10 MB safety limit for AST ope
 pub struct MingmaiServer {
     pub store: Arc<ResourceStore>,
     pub tool_router: ToolRouter<Self>,
+}
+
+impl MingmaiServer {
+    // Build the static docs resources we expose (JSON-first)
+    fn docs_resources(&self) -> Vec<rmcp::model::Resource> {
+        use rmcp::model::{RawResource, Resource};
+        let mut out: Vec<Resource> = Vec::new();
+        let mk = |uri: &str, name: &str, desc: &str| {
+            let mut raw = RawResource::new(uri.to_string(), name.to_string());
+            raw.description = Some(desc.to_string());
+            raw.mime_type = Some("application/json".to_string());
+            Resource {
+                raw,
+                annotations: None,
+            }
+        };
+        out.push(mk(
+            "docs://quickstart",
+            "Quickstart (JSON)",
+            "How to use Mingmai via MCP, JSON-focused guidance",
+        ));
+        out.push(mk(
+            "docs://tools",
+            "Tools Index (JSON)",
+            "All available tools with input schemas and tips",
+        ));
+        out
+    }
+
+    // Advertise parameterized docs
+    fn docs_templates(&self) -> Vec<rmcp::model::ResourceTemplate> {
+        use rmcp::model::{RawResourceTemplate, ResourceTemplate};
+        vec![ResourceTemplate {
+            raw: RawResourceTemplate {
+                uri_template: "docs://tool/{name}".to_string(),
+                name: "Tool Documentation (JSON)".to_string(),
+                title: Some("Tool Docs".to_string()),
+                description: Some("Docs for a specific tool by name".to_string()),
+                mime_type: Some("application/json".to_string()),
+            },
+            annotations: None,
+        }]
+    }
+
+    fn render_docs_json(&self, uri: &str) -> Option<serde_json::Value> {
+        if !uri.starts_with("docs://") {
+            return None;
+        }
+        let rest = &uri["docs://".len()..];
+        match rest {
+            "quickstart" => {
+                let quick = serde_json::json!({
+                    "kind": "quickstart",
+                    "title": "Mingmai Quickstart (JSON)",
+                    "purpose": "Guide LLMs/agents to use Mingmai via MCP with JSON resources and tools",
+                    "capabilities": {
+                        "tools": true,
+                        "resources": true,
+                        "resources.listChanged": true
+                    },
+                    "entry_points": {
+                        "resources": [
+                            {"uri": "docs://tools", "description": "List of tools with schemas"},
+                            {"uri": "docs://tool/{name}", "description": "Template for per-tool docs"}
+                        ],
+                        "rpc": {
+                            "list": "resources/list",
+                            "read": "resources/read",
+                            "templates": "resources/templates/list",
+                            "tool_call": "tools/call"
+                        }
+                    },
+                    "usage_tips": [
+                        "Prefer including JSON docs from docs:// URIs in context",
+                        "Inspect 'input_schema' for required parameters",
+                        "Call tools with minimal valid arguments; read errors from envelopes",
+                        "Use docs://tool/{name} to get focused guidance for a tool",
+                        "All docs are application/json strings for easy parsing"
+                    ]
+                });
+                Some(quick)
+            }
+            "tools" => {
+                let tools = self.tool_router.list_all();
+                let list: Vec<serde_json::Value> = tools
+                    .into_iter()
+                    .map(|t| {
+                        let schema = serde_json::Value::Object((*t.input_schema).clone());
+                        serde_json::json!({
+                            "name": t.name,
+                            "description": t.description,
+                            "input_schema": schema,
+                            "call_example": {
+                                "jsonrpc": "2.0",
+                                "method": "tools/call",
+                                "params": {
+                                    "name": t.name,
+                                    "arguments": "<see input_schema; provide required fields>"
+                                }
+                            }
+                        })
+                    })
+                    .collect();
+                Some(serde_json::json!({
+                    "kind": "tools_index",
+                    "title": "Available Tools (JSON)",
+                    "tools": list
+                }))
+            }
+            _ => {
+                // Support docs://tool/{name}
+                if let Some(name) = rest.strip_prefix("tool/") {
+                    let tools = self.tool_router.list_all();
+                    if let Some(t) = tools.into_iter().find(|tt| tt.name.as_ref() == name) {
+                        let schema = serde_json::Value::Object((*t.input_schema).clone());
+                        let doc = serde_json::json!({
+                            "kind": "tool_doc",
+                            "tool": t.name,
+                            "description": t.description,
+                            "arguments_schema": schema,
+                            "how_to_use": [
+                                "Fill required fields as per arguments_schema",
+                                "Prefer small, validated calls; check Envelope for errors",
+                                "Chain with file/workspace tools as needed"
+                            ],
+                            "example": {
+                                "jsonrpc": "2.0",
+                                "method": "tools/call",
+                                "params": {
+                                    "name": t.name,
+                                    "arguments": "<populate required fields>"
+                                }
+                            }
+                        });
+                        return Some(doc);
+                    } else {
+                        return Some(serde_json::json!({
+                            "kind": "tool_doc",
+                            "error": "tool_not_found",
+                            "name": name
+                        }));
+                    }
+                }
+                None
+            }
+        }
+    }
 }
 
 // --------------------
@@ -837,9 +985,69 @@ impl ServerHandler for MingmaiServer {
                 .enable_tool_list_changed()
                 .enable_resources()
                 .enable_resources_list_changed()
+                .enable_resources_subscribe()
                 .build(),
             ..ServerInfo::default()
         }
+    }
+
+    fn list_resources(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParam>,
+        _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> impl std::future::Future<Output = Result<rmcp::model::ListResourcesResult, ErrorData>> + Send + '_
+    {
+        let resources = self.docs_resources();
+        let result = rmcp::model::ListResourcesResult {
+            next_cursor: None,
+            resources,
+        };
+        std::future::ready(Ok(result))
+    }
+
+    fn read_resource(
+        &self,
+        request: rmcp::model::ReadResourceRequestParam,
+        _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> impl std::future::Future<Output = Result<rmcp::model::ReadResourceResult, ErrorData>> + Send + '_
+    {
+        let uri = request.uri.clone();
+        let mut contents: Vec<rmcp::model::ResourceContents> = Vec::new();
+        if let Some(json) = self.render_docs_json(&uri) {
+            match serde_json::to_string(&json) {
+                Ok(text) => {
+                    contents.push(rmcp::model::ResourceContents::TextResourceContents {
+                        uri,
+                        mime_type: Some("application/json".to_string()),
+                        text,
+                        meta: None,
+                    });
+                }
+                Err(e) => {
+                    tracing::error!(error=%e, "failed to serialize docs json");
+                }
+            }
+        } else {
+            // Unknown docs uri
+        }
+        let result = rmcp::model::ReadResourceResult { contents };
+        std::future::ready(Ok(result))
+    }
+
+    fn list_resource_templates(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParam>,
+        _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> impl std::future::Future<
+        Output = Result<rmcp::model::ListResourceTemplatesResult, ErrorData>,
+    > + Send
+    + '_ {
+        let resource_templates = self.docs_templates();
+        let result = rmcp::model::ListResourceTemplatesResult {
+            next_cursor: None,
+            resource_templates,
+        };
+        std::future::ready(Ok(result))
     }
 
     fn set_level(
