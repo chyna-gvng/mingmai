@@ -7,9 +7,11 @@ use rmcp::{
     model::{ErrorData, ServerInfo},
     tool_router,
 };
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+ use schemars::JsonSchema;
+ use serde::{Deserialize, Serialize};
+ use serde_json::Value;
+ use rmcp::model::AnnotateAble;
+
 
 use crate::{
     edit::Change,
@@ -28,43 +30,53 @@ pub struct MingmaiServer {
 impl MingmaiServer {
     // Build the static docs resources we expose (JSON-first)
     fn docs_resources(&self) -> Vec<rmcp::model::Resource> {
-        use rmcp::model::{RawResource, Resource};
+        use rmcp::model::{RawResource, Resource, Role};
         let mut out: Vec<Resource> = Vec::new();
-        let mk = |uri: &str, name: &str, desc: &str| {
+        let mk = |uri: &str, name: &str, desc: &str, priority: f32| {
             let mut raw = RawResource::new(uri.to_string(), name.to_string());
+            raw.title = Some(name.to_string());
             raw.description = Some(desc.to_string());
             raw.mime_type = Some("application/json".to_string());
-            Resource {
-                raw,
-                annotations: None,
-            }
+            raw
+                .no_annotation()
+                .with_audience(vec![Role::Assistant, Role::User])
+                .with_priority(priority)
+                .with_timestamp_now()
         };
         out.push(mk(
             "docs://quickstart",
             "Quickstart (JSON)",
             "How to use Mingmai via MCP, JSON-focused guidance",
+            1.0,
         ));
         out.push(mk(
             "docs://tools",
             "Tools Index (JSON)",
             "All available tools with input schemas and tips",
+            0.95,
         ));
         out
     }
 
     // Advertise parameterized docs
     fn docs_templates(&self) -> Vec<rmcp::model::ResourceTemplate> {
-        use rmcp::model::{RawResourceTemplate, ResourceTemplate};
-        vec![ResourceTemplate {
-            raw: RawResourceTemplate {
-                uri_template: "docs://tool/{name}".to_string(),
-                name: "Tool Documentation (JSON)".to_string(),
-                title: Some("Tool Docs".to_string()),
-                description: Some("Docs for a specific tool by name".to_string()),
-                mime_type: Some("application/json".to_string()),
+        use rmcp::model::{RawResourceTemplate, ResourceTemplate, Role};
+        vec![
+            ResourceTemplate {
+                raw: RawResourceTemplate {
+                    uri_template: "docs://tool/{name}".to_string(),
+                    name: "Tool Documentation (JSON)".to_string(),
+                    title: Some("Tool Docs".to_string()),
+                    description: Some("Docs for a specific tool by name".to_string()),
+                    mime_type: Some("application/json".to_string()),
+                },
+                annotations: Some(rmcp::model::Annotations {
+                    audience: Some(vec![Role::Assistant, Role::User]),
+                    priority: Some(0.9),
+                    last_modified: Some(chrono::Utc::now()),
+                }),
             },
-            annotations: None,
-        }]
+        ]
     }
 
     fn render_docs_json(&self, uri: &str) -> Option<serde_json::Value> {
@@ -978,7 +990,7 @@ fn pretty_sexp(input: &str) -> String {
 impl ServerHandler for MingmaiServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
-            instructions: Some("Headless IDE for LLMs over MCP".into()),
+            instructions: Some("Headless, LLM-first IDE over MCP. Read docs://quickstart and docs://tools; use docs://tool/{name} before calling tools.".into()),
             capabilities: rmcp::model::ServerCapabilities::builder()
                 .enable_logging()
                 .enable_tools()
